@@ -13,6 +13,7 @@ dependencies = [
     "numpy",
     "scipy",
     "scikit-image",
+    "tifffile",
     "magicgui",
     "qtpy",
 ]

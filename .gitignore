@@ -7,6 +7,8 @@ __pycache__/
 *.so
 
 # data files
+/data/*
+/temp/*
 *.csv
 *.tiff
 *.tif

@@ -22,6 +22,8 @@ from napari.qt.threading import thread_worker
 import napari
 from scipy.ndimage import zoom as ndimage_zoom, binary_dilation, binary_erosion, generate_binary_structure
 
+from ._spatial import scaled_spatial_kwargs, spatial_alignment_kwargs
+
 
 def _tip(text):
     """Return a styled circular '?' label that shows *text* on hover."""
@@ -515,7 +517,8 @@ class RegionGrowWidget(QWidget):
         if ds_name in self.viewer.layers:
             self.viewer.layers.remove(ds_name)
 
-        self.viewer.add_image(ds_image, name=ds_name)
+        spatial_kw = scaled_spatial_kwargs(layer, scale_multiplier=factor)
+        self.viewer.add_image(ds_image, name=ds_name, **spatial_kw)
         self._preprocessed_images[ds_name] = {
             "original_name": name,
             "original_shape": tuple(image_data.shape),
@@ -555,10 +558,12 @@ class RegionGrowWidget(QWidget):
         if result_name in self.viewer.layers:
             self.viewer.layers[result_name].data = upsampled.astype(np.int32)
         else:
+            orig_layer = self.viewer.layers[info["original_name"]]
             self.viewer.add_labels(
                 upsampled.astype(np.int32),
                 name=result_name,
                 opacity=0.5,
+                **spatial_alignment_kwargs(orig_layer),
             )
 
         self.status_label.setText("Postprocessing complete: upsampled result created.")
@@ -605,6 +610,7 @@ class RegionGrowWidget(QWidget):
                 result.astype(np.int32),
                 name=result_name,
                 opacity=0.5,
+                **spatial_alignment_kwargs(self._result_layer),
             )
 
         self.status_label.setText(
@@ -617,8 +623,11 @@ class RegionGrowWidget(QWidget):
             self.status_label.setText("Select an image layer first.")
             return
         shape = self.viewer.layers[name].data.shape
+        ref = self.viewer.layers[name]
         lbl = self.viewer.add_labels(
-            np.zeros(shape, dtype=np.int32), name="Vessel Seed"
+            np.zeros(shape, dtype=np.int32),
+            name="Vessel Seed",
+            **spatial_alignment_kwargs(ref),
         )
         lbl.mode = "paint"
         lbl.brush_size = 3
@@ -626,12 +635,19 @@ class RegionGrowWidget(QWidget):
         self.labels_combo.setCurrentText("Vessel Seed")
 
     def _create_points_layer(self):
+        name = self.image_combo.currentText()
+        spatial_kw = (
+            spatial_alignment_kwargs(self.viewer.layers[name])
+            if name and name in self.viewer.layers
+            else {}
+        )
         pts = self.viewer.add_points(
             np.empty((0, 3)),
             ndim=3,
             name="Start/End Points",
             size=5,
             face_color="magenta",
+            **spatial_kw,
         )
         pts.mode = "add"
         self._refresh_layers()
@@ -690,6 +706,7 @@ class RegionGrowWidget(QWidget):
                 np.zeros(image_data.shape, dtype=np.int32),
                 name="Segmentation Result",
                 opacity=0.5,
+                **spatial_alignment_kwargs(image_layer),
             )
 
         self.btn_run.setEnabled(False)
