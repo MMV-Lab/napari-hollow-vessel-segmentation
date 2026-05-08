@@ -28,6 +28,38 @@ def spatial_alignment_kwargs(ref_layer: Any) -> Dict[str, Any]:
     return out
 
 
+def spatial_alignment_for_pyramid_level(ref_layer: Any, level: int) -> Dict[str, Any]:
+    """Spatial kwargs for a layer whose ``data.shape`` matches pyramid *level*.
+
+    Napari multiscale Images keep ``scale`` in **finest-voxel** physical units.
+    A labels array at a coarser level has one voxel per ``downsample_factors[level]``
+    finest voxels along each axis, so each coarse voxel must be drawn ``factor``
+    times larger in world space — multiply ``scale`` accordingly. ``translate`` /
+    ``rotate`` / ``shear`` stay unchanged (shared origin).
+    """
+    kwargs = spatial_alignment_kwargs(ref_layer)
+    if not getattr(ref_layer, "multiscale", False):
+        return kwargs
+    if "scale" not in kwargs:
+        return kwargs
+    try:
+        factors = np.asarray(
+            ref_layer.downsample_factors[int(level)], dtype=np.float64
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return kwargs
+    orig = np.asarray(kwargs["scale"], dtype=np.float64)
+    flat = orig.ravel()
+    fac = factors.ravel()
+    if fac.size < flat.size:
+        fac = np.pad(fac, (flat.size - fac.size, 0), constant_values=1.0)
+    elif fac.size > flat.size:
+        fac = fac[-flat.size :]
+    fac[fac <= 0] = 1.0
+    kwargs["scale"] = (flat * fac).reshape(orig.shape)
+    return kwargs
+
+
 def scaled_spatial_kwargs(
     ref_layer: Any, *, scale_multiplier: np.ndarray | float | int
 ) -> Dict[str, Any]:

@@ -87,6 +87,19 @@ def _ome_axis_scales_microns(omexml: str) -> Tuple[Dict[str, float], bool]:
     return out, explicit
 
 
+def _index_first_along_axis(data: np.ndarray, axis: int) -> np.ndarray:
+    """Select index ``0`` along *axis* using slicing (often a view on ``memmap``).
+
+    ``numpy.take(..., 0, axis=...)`` can materialize a full copy for large arrays,
+    which is unsafe for multi-gigabyte memory-mapped volumes.
+    """
+    if axis < 0:
+        axis += data.ndim
+    slc: List[slice | int] = [slice(None)] * data.ndim
+    slc[axis] = 0
+    return data[tuple(slc)]
+
+
 def _squeeze_trailing_extras(data: np.ndarray, axes: str) -> Tuple[np.ndarray, str]:
     """Drop length-1 *T* / *S* / *I* / *H* / *A* dimensions (not *C*)."""
     d = data
@@ -98,7 +111,7 @@ def _squeeze_trailing_extras(data: np.ndarray, axes: str) -> Tuple[np.ndarray, s
             if i >= d.ndim:
                 break
             if d.shape[i] == 1 and letter.upper() in "TSIHA":
-                d = np.take(d, 0, axis=i)
+                d = _index_first_along_axis(d, i)
                 ax = ax[:i] + ax[i + 1 :]
                 changed = True
                 break
@@ -111,7 +124,7 @@ def _take_axis0(data: np.ndarray, axes: str, letter: str) -> Tuple[np.ndarray, s
     if letter not in ax_u:
         return data, axes
     idx = ax_u.index(letter)
-    d = np.take(data, 0, axis=idx)
+    d = _index_first_along_axis(data, idx)
     ax = axes[:idx] + axes[idx + 1 :]
     return d, ax
 
@@ -146,30 +159,93 @@ def _collapse_time_and_channel(data: np.ndarray, axes: str) -> Tuple[np.ndarray,
     return d, ax
 
 
-def _transpose_to_zyx(data: np.ndarray, axes: str) -> Tuple[np.ndarray, str]:
-    """Return *data* shaped ``(Z, Y, X)`` with *axes* ``'ZYX'`` when possible."""
+def transpose_perm_to_zyx(axes: str, ndim: int) -> Tuple[int, int, int]:
+    """Permutation for ``numpy.transpose`` / ``dask.transpose`` to obtain ``ZYX`` order."""
     ax_u = axes.upper()
-    if data.ndim != len(ax_u):
-        raise ValueError(f"axes {axes!r} does not match array ndim {data.ndim}")
-
+    if ndim != len(ax_u):
+        raise ValueError(f"axes {axes!r} does not match array ndim {ndim}")
     if ax_u == "ZYX":
-        return data, "ZYX"
-
+        return (0, 1, 2)
     if set(ax_u) >= {"Z", "Y", "X"}:
-        perm = [ax_u.index("Z"), ax_u.index("Y"), ax_u.index("X")]
-        d = np.transpose(data, perm)
-        return d, "ZYX"
-
+        return (ax_u.index("Z"), ax_u.index("Y"), ax_u.index("X"))
     raise ValueError(
         f"Cannot map axes {axes!r} to ZYX for 3-D vessel segmentation "
         "(need Z, Y, and X dimensions)."
     )
 
 
+def _transpose_to_zyx(data: np.ndarray, axes: str) -> Tuple[np.ndarray, str]:
+    """Return *data* shaped ``(Z, Y, X)`` with *axes* ``'ZYX'`` when possible."""
+    perm = transpose_perm_to_zyx(axes, data.ndim)
+    if perm == (0, 1, 2):
+        return data, "ZYX"
+    return np.transpose(data, perm), "ZYX"
+
+
 def _scale_for_axes(axes_zyx: str, scales_xyz: Dict[str, float]) -> Tuple[float, float, float]:
     """``napari`` image scale order matches array axes (here Z, Y, X)."""
     mapping = {"Z": scales_xyz["Z"], "Y": scales_xyz["Y"], "X": scales_xyz["X"]}
     return tuple(float(mapping[a]) for a in axes_zyx.upper())
+
+
+def volume_spacing_meta_pre_transpose(
+    data: np.ndarray,
+    axes: str,
+    omexml: str,
+    path_for_errors: str | Path,
+) -> Tuple[np.ndarray, str, Tuple[float, float, float], Dict[str, Any], bool]:
+    """Squeeze/collapse to 3-D and spacing/meta, **before** mapping axes to ``ZYX``.
+
+    Keeping the array in on-disk axis order avoids building a non-contiguous
+    transposed view of a huge memory map (which can trigger SIGBUS when read in
+    arbitrary chunk shapes).
+    """
+    path_for_errors = Path(path_for_errors)
+    scales_xyz, physical_sizes_in_ome = _ome_axis_scales_microns(omexml)
+    meta: Dict[str, Any] = {
+        "ome_voxel_size_microns": {
+            "x": scales_xyz["X"],
+            "y": scales_xyz["Y"],
+            "z": scales_xyz["Z"],
+        },
+        "ome_axes_original": axes,
+        "source_path": str(path_for_errors.resolve()),
+    }
+    # ``np.asarray`` can drop the ``memmap`` subclass and break downstream mmap checks;
+    # ``asanyarray`` keeps memory-backed subclasses (e.g. slab temp file).
+    d, ax = _squeeze_trailing_extras(np.asanyarray(data), axes)
+    d, ax = _collapse_time_and_channel(d, ax)
+
+    if d.ndim != 3:
+        raise ValueError(
+            f"{path_for_errors}: after removing singletons / picking a channel, expected "
+            f"a 3-D volume, got shape {d.shape} with axes {ax!r}."
+        )
+    try:
+        transpose_perm_to_zyx(ax, d.ndim)
+    except ValueError as exc:
+        raise ValueError(f"{path_for_errors}: {exc}") from exc
+
+    scale = _scale_for_axes("ZYX", scales_xyz)
+    return d, ax, scale, meta, physical_sizes_in_ome
+
+
+def volume_zyx_spacing_meta_from_stack(
+    data: np.ndarray,
+    axes: str,
+    omexml: str,
+    path_for_errors: str | Path,
+) -> Tuple[np.ndarray, Tuple[float, float, float], Dict[str, Any], bool]:
+    """Normalize a TIFF series stack to ``ZYX`` plus spacing and OME-style metadata.
+
+    *data* may be a memory-mapped array; ``numpy.asarray`` is used only where a
+    view is insufficient for axis cleanup.
+    """
+    d, ax, scale, meta, physical_sizes_in_ome = volume_spacing_meta_pre_transpose(
+        data, axes, omexml, path_for_errors
+    )
+    d, ax = _transpose_to_zyx(d, ax)
+    return d, scale, meta, physical_sizes_in_ome
 
 
 def read_ome_tiff(path: str | Path) -> List[LayerDataTuple]:
@@ -183,30 +259,9 @@ def read_ome_tiff(path: str | Path) -> List[LayerDataTuple]:
         axes = series.axes
         omexml = tif.ome_metadata or ""
 
-    scales_xyz, physical_sizes_in_ome = _ome_axis_scales_microns(omexml)
-    meta: Dict[str, Any] = {
-        "ome_voxel_size_microns": {
-            "x": scales_xyz["X"],
-            "y": scales_xyz["Y"],
-            "z": scales_xyz["Z"],
-        },
-        "ome_axes_original": axes,
-        "source_path": str(path.resolve()),
-    }
-    d, ax = _squeeze_trailing_extras(np.asarray(data), axes)
-    d, ax = _collapse_time_and_channel(d, ax)
-    try:
-        d, ax = _transpose_to_zyx(d, ax)
-    except ValueError as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-
-    if d.ndim != 3:
-        raise ValueError(
-            f"{path}: after removing singletons / picking a channel, expected a 3-D "
-            f"volume, got shape {d.shape} with axes {ax!r}."
-        )
-
-    scale = _scale_for_axes("ZYX", scales_xyz)
+    d, scale, meta, physical_sizes_in_ome = volume_zyx_spacing_meta_from_stack(
+        data, axes, omexml, path
+    )
     kwargs: Dict[str, Any] = {
         "name": path.stem,
         "rgb": False,

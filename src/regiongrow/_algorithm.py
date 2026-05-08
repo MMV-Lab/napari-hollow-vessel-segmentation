@@ -3,7 +3,7 @@
 Combines three literature-based stopping criteria for robust vessel
 boundary detection:
 
-1. **Geodesic cost accumulation** (Fast Marching, Sethian 1996)
+1. **Edge-weighted accumulated cost** (Dijkstra-style min-heap front)
    Each voxel has a base traversal cost = 1 / (eps + g(x)) where
    g(x) = exp(-beta |grad I|^2 / kappa^2) is the edge indicator.
    Growth proceeds cheapest-first via a min-heap; accumulated cost
@@ -24,10 +24,17 @@ boundary detection:
    Candidates far below the region mean are rejected.
 """
 
-import numpy as np
-from scipy.ndimage import gaussian_filter, generate_binary_structure, binary_dilation
-from skimage.filters import threshold_otsu, threshold_triangle, threshold_li
+from __future__ import annotations
+
 import heapq
+
+import numpy as np
+from scipy.ndimage import (
+    gaussian_filter,
+    generate_binary_structure,
+    binary_dilation,
+)
+from skimage.filters import threshold_otsu, threshold_triangle, threshold_li
 
 
 # ──────────────────────────── helpers ────────────────────────────────────── #
@@ -38,23 +45,48 @@ _OFFSETS_6 = np.array(
 )
 
 
-def _precompute_edge_map(image, sigma):
-    """Return edge indicator *g*, gradient vector field, magnitude, and kappa.
+def _normalize_spacing(spacing, shape):
+    """Return ``(sz, sy, sx)`` as float64, defaulting to isotropic 1 if missing."""
+    if spacing is None:
+        return np.ones(3, dtype=np.float64)
+    s = np.asarray(spacing, dtype=np.float64).ravel()
+    if s.size == 1:
+        s = np.broadcast_to(s, (3,))
+    if s.size < 3:
+        s = np.pad(s, (0, 3 - s.size), constant_values=1.0)
+    s = s[-3:].copy()
+    s[s <= 0] = 1.0
+    return s
 
-    Uses a Lorentzian (rational) edge indicator for better dynamic range
-    than the exponential form:
 
-        g(x) = 1 / (1 + (|grad I(x)| / kappa)^2)
+def _step_distance(offset, spacing):
+    """Physical edge length for one 6-neighbour step *offset* (±1 on one axis)."""
+    o = np.asarray(offset, dtype=np.int32)
+    if int(np.sum(np.abs(o))) != 1:
+        raise ValueError("only 6-connected offsets are supported")
+    if o[0] != 0:
+        return float(spacing[0])
+    if o[1] != 0:
+        return float(spacing[1])
+    return float(spacing[2])
 
-    kappa is auto-calibrated as the 90th percentile of |grad I|, which
-    separates moderate texture/noise from real structural edges.
 
-    The Lorentzian smoothly decreases from 1 (no gradient) to ~0 (strong
-    edge) without the saturation problem of the exponential, preserving
-    cost discrimination across the full range of edge strengths.
+def _precompute_edge_map(image, sigma, spacing):
+    """Return edge indicator *g*, physical gradient, magnitude, and *kappa*.
+
+    Gaussian smoothing uses *sigma* interpreted as an **isotropic physical**
+    standard deviation in the same units as *spacing* (converted to voxel
+    sigmas per axis).  Gradients use ``numpy.gradient`` with *spacing* so
+    shallow intensity changes across thick Z-slices are not mistaken for
+    strong edges.
     """
-    smoothed = gaussian_filter(image, sigma=sigma)
-    grad = np.array(np.gradient(smoothed))          # (3, Z, Y, X)
+    spacing = np.asarray(spacing, dtype=np.float64)
+    sigma = float(sigma)
+    sigma_vox = tuple(float(sigma) / max(spacing[i], 1e-12) for i in range(3))
+    smoothed = gaussian_filter(image, sigma=sigma_vox)
+    grad = np.array(
+        np.gradient(smoothed, spacing[0], spacing[1], spacing[2])
+    )  # (3, Z, Y, X), physical derivatives
     grad_mag = np.sqrt(np.sum(grad ** 2, axis=0))
 
     nonzero = grad_mag[grad_mag > 0]
@@ -70,6 +102,37 @@ def _seed_boundary(seed_mask):
     struct = generate_binary_structure(3, 1)
     dilated = binary_dilation(seed_mask, structure=struct)
     return np.where(dilated & ~seed_mask)
+
+
+def _init_heap_from_seed_boundary(
+    local_cost,
+    seed_mask,
+    spacing,
+    shape,
+    acc_cost,
+    heap,
+    forbidden=None,
+):
+    """Push seed-front voxels with physically weighted costs."""
+    spacing = np.asarray(spacing, dtype=np.float64)
+    bz, by, bx = _seed_boundary(seed_mask)
+    for i in range(len(bz)):
+        z, y, x = int(bz[i]), int(by[i]), int(bx[i])
+        if forbidden is not None and forbidden[z, y, x]:
+            continue
+        best = np.inf
+        for off in _OFFSETS_6:
+            nz = z - int(off[0])
+            ny = y - int(off[1])
+            nx = x - int(off[2])
+            if 0 <= nz < shape[0] and 0 <= ny < shape[1] and 0 <= nx < shape[2]:
+                if seed_mask[nz, ny, nx]:
+                    step = _step_distance(off, spacing)
+                    c = float(local_cost[z, y, x]) * step
+                    if c < best:
+                        best = c
+        acc_cost[z, y, x] = best
+        heapq.heappush(heap, (best, z, y, x))
 
 
 def compute_upper_threshold(image, method):
@@ -114,6 +177,7 @@ def region_grow(
     end_point,
     # ── edge / speed ──
     sigma=2.0,
+    spacing=None,
     # ── stopping gates ──
     cost_budget=None,           # max accumulated cost (auto if None)
     flux_weight=15.0,           # soft flux penalty weight
@@ -123,6 +187,9 @@ def region_grow(
     margin=5.0,
     # ── visualisation ──
     yield_every=500,
+    # ── optional: Welford stats from this mask instead of full seed_mask ──
+    stats_seed_mask=None,
+    forbidden_mask=None,
 ):
     """Priority-queue region growing for 3-D vessel segmentation.
 
@@ -135,11 +202,16 @@ def region_grow(
     start_point, end_point : array-like (z, y, x)
         Vessel start and end coordinates for length constraint.
     sigma : float
-        Gaussian smoothing sigma before gradient computation.
-        Larger -> ignores small surface wrinkles.
+        Isotropic Gaussian smoothing **physical** standard deviation (same
+        units as *spacing*).  Converted to per-axis voxel sigmas internally.
+    spacing : sequence of 3 floats, optional
+        Voxel spacing ``(s_z, s_y, s_x)`` matching *image* axes.  When omitted,
+        behaviour matches the former isotropic ``(1, 1, 1)`` implementation.
     cost_budget : float or None
-        Maximum accumulated geodesic cost a voxel may have to be accepted.
+        Maximum accumulated growth cost a voxel may have to be accepted.
         If *None*, auto-calibrated from the image edge indicator.
+        Values ``> 0`` are scaled by the mean spacing so manual budgets remain
+        comparable when switching between isotropic and anisotropic grids.
     flux_weight : float
         Soft flux penalty weight.  When the normalised gradient flux
         (cos theta) is negative, the local traversal cost is multiplied
@@ -150,9 +222,20 @@ def region_grow(
         Reject a candidate whose intensity is more than this many standard
         deviations below the adaptive region mean.
     margin : float
-        Extra voxel leeway beyond start / end planes.
+        Extra leeway along the vessel axis in **physical** length, computed as
+        ``margin * mean(spacing)`` (the spin box is still labelled as a voxel
+        margin; this scales it to world units consistently with anisotropic
+        grids).
     yield_every : int
         Yield (step, mask) every *N* accepted voxels for animation.
+    stats_seed_mask : bool ndarray, optional
+        If given, initial mean/variance for the intensity gate are taken from
+        ``image[stats_seed_mask]`` instead of ``image[seed_mask]``.  Use a thin
+        A* skeleton (excluding a thick overlap with an existing segmentation)
+        so the adaptive gate matches the branch lumen.
+    forbidden_mask : bool ndarray, optional
+        Same shape as *image*. True voxels are never grown into (walls); seed
+        voxels overlapping forbidden are cleared before propagation.
 
     Yields
     ------
@@ -161,38 +244,56 @@ def region_grow(
 
     image = np.asarray(image, dtype=np.float64)
     seed_mask = np.asarray(seed_mask, dtype=bool)
-
     shape = image.shape
+    spacing = _normalize_spacing(spacing, shape)
+    mean_s = float(np.mean(spacing))
+
+    forbidden = None
+    if forbidden_mask is not None:
+        forbidden = np.asarray(forbidden_mask, dtype=bool)
+        if forbidden.shape != shape:
+            raise ValueError(
+                f"forbidden_mask shape {forbidden.shape} != image shape {shape}"
+            )
+        seed_mask = seed_mask & ~forbidden
 
     # ── 1. Pre-compute edge indicator & gradient vector field ───────────
-    g, grad, grad_mag, kappa = _precompute_edge_map(image, sigma)
+    g, grad, grad_mag, kappa = _precompute_edge_map(image, sigma, spacing)
 
     epsilon = 0.01
     local_cost = 1.0 / (epsilon + g)        # high at edges, ~1 in smooth
 
-    # ── 2. Auto-calibrate cost budget ───────────────────────────────────
-    #
-    # Strategy: the cost budget should allow traversing the entire vessel
-    # cross-section but not much further.  We estimate this as:
-    #   budget = (typical edge cost) * (generous radial distance factor)
-    # Using the 95th percentile of local_cost ensures we account for
-    # real edges, and a multiplier of 50 allows ~50 high-cost steps
-    # (traversal through the wall) plus many more smooth-cost steps.
+    # ── 2. Auto-calibrate cost budget (physical path length) ───────────
     if cost_budget is None:
         p95 = float(np.percentile(local_cost, 95))
         p50 = float(np.median(local_cost))
-        cost_budget = p95 * 30 + p50 * 50
+        cost_budget = (p95 * 30 + p50 * 50) * mean_s
+    else:
+        cost_budget = float(cost_budget) * mean_s
 
-    # ── 3. Axis constraint ──────────────────────────────────────────────
+    # ── 3. Axis constraint (physical coordinates) ───────────────────────
     start = np.asarray(start_point, dtype=np.float64)
     end = np.asarray(end_point, dtype=np.float64)
-    axis = end - start
-    axis_len = float(np.linalg.norm(axis))
-    axis_dir = axis / axis_len if axis_len > 0 else None
+    axis_idx = end - start
+    axis_phys = axis_idx * spacing
+    axis_len_phys = float(np.linalg.norm(axis_phys))
+    if axis_len_phys > 1e-10:
+        axis_dir_phys = axis_phys / axis_len_phys
+    else:
+        axis_dir_phys = None
+    margin_phys = float(margin) * mean_s
 
     # ── 4. Region mask & Welford running statistics ─────────────────────
     region = seed_mask.copy()
-    seed_vals = image[seed_mask]
+    if stats_seed_mask is not None:
+        stat_mask = np.asarray(stats_seed_mask, dtype=bool)
+        if stat_mask.shape != shape:
+            stat_mask = seed_mask
+        elif not np.any(stat_mask):
+            stat_mask = seed_mask
+    else:
+        stat_mask = seed_mask
+    seed_vals = image[stat_mask]
     n_acc = int(seed_vals.size)
     mu = float(np.mean(seed_vals))
     m2 = float(np.sum((seed_vals - mu) ** 2))
@@ -202,12 +303,9 @@ def region_grow(
     acc_cost[seed_mask] = 0.0
 
     heap: list = []
-    bz, by, bx = _seed_boundary(seed_mask)
-    for i in range(len(bz)):
-        z, y, x = int(bz[i]), int(by[i]), int(bx[i])
-        c = float(local_cost[z, y, x])
-        acc_cost[z, y, x] = c
-        heapq.heappush(heap, (c, z, y, x))
+    _init_heap_from_seed_boundary(
+        local_cost, seed_mask, spacing, shape, acc_cost, heap, forbidden
+    )
 
     # ── 6. Yield initial state ──────────────────────────────────────────
     yield 0, region.copy()
@@ -223,18 +321,20 @@ def region_grow(
         if cost_val > acc_cost[z, y, x]:
             continue
 
-        # gate A: geodesic cost budget
+        if forbidden is not None and forbidden[z, y, x]:
+            continue
+
+        # gate A: accumulated cost budget
         if cost_val > cost_budget:
             break
 
         step += 1
 
-        # gate B: length constraint
-        if axis_dir is not None:
-            proj = float(np.dot(
-                np.array([z, y, x], dtype=np.float64) - start, axis_dir
-            ))
-            if proj < -margin or proj > axis_len + margin:
+        # gate B: length constraint (physical projection)
+        if axis_dir_phys is not None:
+            r_phys = (np.array([z, y, x], dtype=np.float64) - start) * spacing
+            proj = float(np.dot(r_phys, axis_dir_phys))
+            if proj < -margin_phys or proj > axis_len_phys + margin_phys:
                 continue
 
         # gate C: adaptive intensity
@@ -258,38 +358,52 @@ def region_grow(
         m2 += delta * delta2
 
         # ── Compute flux-weighted cost for neighbours ──
-        # Outward normal from segmented-neighbour centroid
+        # Outward normal from segmented-neighbour centroid (physical space)
         cz_s, cy_s, cx_s, n_seg = 0.0, 0.0, 0.0, 0
         for off in _OFFSETS_6:
             nz, ny, nx = z + off[0], y + off[1], x + off[2]
             if 0 <= nz < shape[0] and 0 <= ny < shape[1] and 0 <= nx < shape[2]:
                 if region[nz, ny, nx]:
-                    cz_s += nz; cy_s += ny; cx_s += nx
+                    cz_s += nz
+                    cy_s += ny
+                    cx_s += nx
                     n_seg += 1
 
         for off in _OFFSETS_6:
-            nz = z + int(off[0]); ny = y + int(off[1]); nx = x + int(off[2])
+            nz = z + int(off[0])
+            ny = y + int(off[1])
+            nx = x + int(off[2])
             if 0 <= nz < shape[0] and 0 <= ny < shape[1] and 0 <= nx < shape[2]:
                 if not region[nz, ny, nx]:
-                    base_inc = float(local_cost[nz, ny, nx])
+                    if forbidden is not None and forbidden[nz, ny, nx]:
+                        continue
+                    step_len = _step_distance(off, spacing)
+                    base_inc = float(local_cost[nz, ny, nx]) * step_len
 
-                    # Flux-based soft cost multiplier
+                    # Flux-based soft cost multiplier (physical outward direction)
                     flux_mult = 1.0
                     if n_seg > 0:
-                        dz = nz - cz_s / n_seg
-                        dy = ny - cy_s / n_seg
-                        dx = nx - cx_s / n_seg
-                        norm = np.sqrt(dz * dz + dy * dy + dx * dx)
+                        dz_i = nz - cz_s / n_seg
+                        dy_i = ny - cy_s / n_seg
+                        dx_i = nx - cx_s / n_seg
+                        dz_p = dz_i * spacing[0]
+                        dy_p = dy_i * spacing[1]
+                        dx_p = dx_i * spacing[2]
+                        norm = float(np.sqrt(dz_p * dz_p + dy_p * dy_p + dx_p * dx_p))
                         if norm > 1e-10:
-                            nz_o = dz / norm; ny_o = dy / norm; nx_o = dx / norm
+                            uz = dz_p / norm
+                            uy = dy_p / norm
+                            ux = dx_p / norm
                             gz = float(grad[0, nz, ny, nx])
                             gy = float(grad[1, nz, ny, nx])
                             gx = float(grad[2, nz, ny, nx])
                             gm = float(grad_mag[nz, ny, nx])
                             if gm > 1e-10:
-                                cos_theta = (gz * nz_o + gy * ny_o + gx * nx_o) / gm
+                                cos_theta = (gz * uz + gy * uy + gx * ux) / gm
                                 if cos_theta < 0:
-                                    flux_mult = 1.0 + flux_weight * cos_theta * cos_theta
+                                    flux_mult = (
+                                        1.0 + flux_weight * cos_theta * cos_theta
+                                    )
 
                     nc = cost_val + base_inc * flux_mult
                     if nc < acc_cost[nz, ny, nx]:
@@ -304,3 +418,109 @@ def region_grow(
     # Always yield final state
     if step != last_yielded:
         yield step, region.copy()
+
+
+# ──────────────────────── branch polyline tube (no A*) ─────────────────── #
+
+
+def polyline_to_line_mask(shape: tuple, poly_zyx: np.ndarray) -> np.ndarray:
+    """One-voxel-thick polyline through ordered ``(z,y,x)`` integer knots."""
+    try:
+        from skimage.draw import line_nd as _line_nd
+    except ImportError:
+        _line_nd = None
+
+    poly = np.asarray(poly_zyx, dtype=np.int64).reshape(-1, 3)
+    mask = np.zeros(shape, dtype=bool)
+    if poly.shape[0] == 0:
+        return mask
+    z, y, x = poly[0]
+    if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
+        mask[z, y, x] = True
+    for i in range(poly.shape[0] - 1):
+        a = poly[i]
+        b = poly[i + 1]
+        if _line_nd is not None:
+            try:
+                idx = _line_nd(a, b, endpoint=True)
+            except TypeError:
+                idx = _line_nd(a, b)
+            mask[tuple(idx)] = True
+        else:
+            n = int(np.max(np.abs(b - a))) + 1
+            for t in np.linspace(0.0, 1.0, max(n, 2)):
+                vz, vy, vx = np.round(a + t * (b - a)).astype(np.int64)
+                if (
+                    0 <= vz < shape[0]
+                    and 0 <= vy < shape[1]
+                    and 0 <= vx < shape[2]
+                ):
+                    mask[vz, vy, vx] = True
+    return mask
+
+
+def polyline_tube_mask(
+    shape: tuple,
+    poly_zyx: np.ndarray,
+    radius_vox: float,
+    spacing,
+) -> np.ndarray:
+    """Physical tube around the polyline (same radius convention as MGAC EDT tube).
+
+    Distance transform is computed on the full ``shape`` volume; use a coarser
+    OME-Zarr / napari pyramid level when memory or runtime is limiting.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    spacing = _normalize_spacing(spacing, shape)
+    poly = np.asarray(poly_zyx, dtype=np.int64).reshape(-1, 3)
+    if poly.shape[0] == 0:
+        return np.zeros(shape, dtype=bool)
+    radius_phys = float(radius_vox) * float(np.min(spacing))
+    line = polyline_to_line_mask(shape, poly)
+    if not np.any(line):
+        return np.zeros(shape, dtype=bool)
+    dist = distance_transform_edt(
+        ~line, sampling=tuple(float(x) for x in spacing)
+    )
+    return (dist <= radius_phys).astype(bool)
+
+
+def polyline_corridor_mask(
+    shape: tuple,
+    poly_zyx: np.ndarray,
+    spacing,
+    margin_voxels: float,
+    tube_radius_voxels: float,
+) -> np.ndarray:
+    """Voxels within physical distance *R* of the rasterized polyline centerline.
+
+    Branch MGAC used to clip with :func:`regiongrow._active_contour._length_mask`
+    (cylinder between first and last knot only).  Curved branches then had most
+    of the seed tube **outside** that cylinder, so ``init_level_set & lmask``
+    was tiny or empty and the contour eroded away.  This mask follows the
+    **entire** polyline; *R* combines the same ``margin`` convention as the
+    chord mask (``margin_voxels * mean(spacing)``) with several times the seed
+    tube radius so balloon expansion can fill the branch lumen.
+
+    EDT uses the full ``shape`` volume; prefer a coarser pyramid level for large
+    data instead of spatial cropping.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    spacing = _normalize_spacing(spacing, shape)
+    poly = np.asarray(poly_zyx, dtype=np.int64).reshape(-1, 3)
+    if poly.shape[0] == 0:
+        return np.zeros(shape, dtype=bool)
+    mean_s = float(np.mean(spacing))
+    min_s = float(np.min(spacing))
+    margin_phys = float(margin_voxels) * mean_s
+    tube_phys = float(tube_radius_voxels) * min_s
+    r_phys = margin_phys + max(5.0 * tube_phys, tube_phys + 2.5 * margin_phys)
+    line = polyline_to_line_mask(shape, poly)
+    if not np.any(line):
+        return np.zeros(shape, dtype=bool)
+    dist = distance_transform_edt(
+        ~line.astype(bool), sampling=tuple(float(x) for x in spacing)
+    )
+    return (dist <= r_phys).astype(bool)
