@@ -17,25 +17,23 @@ The plugin uses one workflow for every vessel segment (main trunk or side branch
 
 ## Install
 
-Requires **Python ≥ 3.10** and a working **napari** with a Qt backend (e.g. `pip install "napari[all]"`). The core install already includes the OME-Zarr stack (`zarr`, `ome-zarr`, `numcodecs`, `dask`) needed for the reader, saver, and merge autosave:
+Requires **Python ≥ 3.11** and a working **napari** with a Qt backend (e.g. `pip install "napari[all]"`). One install provides the napari plugin, OME-Zarr I/O, preprocessing CLIs, and image → OME-Zarr conversion (OME-TIFF, TIFF, PNG, JPEG, and other [BioIO reader plugins](https://bioio-devs.github.io/bioio/OVERVIEW.html)):
 
 ```bash
 pip install -e .
 ```
 
-### Install matrix
+For development with tests:
 
-| Task | Command | Python |
-| --- | --- | --- |
-| Plugin (read/grow/save OME-Zarr, preprocess CLIs) | `pip install -e .` | ≥ 3.10 |
-| OME-TIFF → OME-Zarr conversion (BioIO writer) | `pip install -e ".[zarr-cli-bioio]"` | ≥ 3.11 |
-| Run the test suite | `pip install -e ".[test]"` | ≥ 3.10 |
+```bash
+pip install -e ".[test]"
+```
 
-`zarr-cli-bioio` is heavier and pins **Python ≥ 3.11**, so it often lives in a separate conda env (e.g. `ome-zarr-bioio`). Add extras **in the same conda/venv** you use for each task.
+Console scripts (also available after install):
 
-Console scripts: `regiongrow-convert-to-ome-zarr` (BioIO path), `regiongrow-preprocess-zarr`, `regiongrow-preprocess-ome-tiff`.  
-From the repo with `zarr-cli-bioio` installed: `python -m regiongrow.cli.ome_tiff_to_zarr_bioio …`.  
-From a napari/Python 3.10 env, use **`./run_ome_tiff_to_zarr_bioio.sh`** (wraps `conda run -n ome-zarr-bioio …`).
+- `regiongrow-convert-to-ome-zarr` — any BioIO-readable image → multiscale OME-Zarr
+- `regiongrow-preprocess-zarr` — contrast stretch / downsample on OME-Zarr
+- `regiongrow-preprocess-ome-tiff` — contrast stretch / downsample on OME-TIFF
 
 ## OME-Zarr and large volumes
 
@@ -52,9 +50,7 @@ From a napari/Python 3.10 env, use **`./run_ome_tiff_to_zarr_bioio.sh`** (wraps 
 
 ```bash
 regiongrow-convert-to-ome-zarr volume.ome.tif -o volume.ome.zarr --levels 6
-# or from repo root when napari env is not 3.11+:
-./run_ome_tiff_to_zarr_bioio.sh volume.ome.tif -o volume.ome.zarr --levels 6
-
+regiongrow-convert-to-ome-zarr stack.tif -o stack.ome.zarr --voxel-size 2.0,0.65,0.65
 regiongrow-preprocess-zarr volume.ome.zarr volume_stretched.ome.zarr --stretch --no-downsample
 ```
 
