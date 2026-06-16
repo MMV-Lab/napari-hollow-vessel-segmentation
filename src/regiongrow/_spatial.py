@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 
@@ -58,6 +58,67 @@ def spatial_alignment_for_pyramid_level(ref_layer: Any, level: int) -> Dict[str,
     fac[fac <= 0] = 1.0
     kwargs["scale"] = (flat * fac).reshape(orig.shape)
     return kwargs
+
+
+def spatial_alignment_for_saved_labels(
+    image_layer: Any, labels_data: Any
+) -> Dict[str, Any]:
+    """Spatial kwargs for NGFF labels loaded next to a (multiscale) image.
+
+    Saved labels are often stored at a **working** pyramid resolution, not the
+    image finest grid.  Align to whichever image pyramid level matches the
+    finest labels array shape so the mask is not shifted off-screen (looks empty).
+    """
+    from regiongrow._volume_utils import (
+        finest_labels_data_shape,
+        image_level_index_for_shape,
+    )
+
+    shp = finest_labels_data_shape(labels_data)
+    if len(shp) < 3:
+        return spatial_alignment_kwargs(image_layer)
+    shp3 = tuple(int(x) for x in shp[-3:])
+    matched = image_level_index_for_shape(image_layer, shp3)
+    if matched is not None:
+        return spatial_alignment_for_pyramid_level(image_layer, int(matched))
+    return spatial_alignment_kwargs(image_layer)
+
+
+def world_bounds_zyx_for_pyramid_level(
+    ref_layer: Any, level: int
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+    """Inclusive world (min, max) along Z, Y, X for voxels at pyramid *level*."""
+    from regiongrow._volume_utils import image_level_shape
+
+    skw = spatial_alignment_for_pyramid_level(ref_layer, int(level))
+    try:
+        shp = tuple(int(x) for x in image_level_shape(ref_layer, int(level)))
+    except (TypeError, ValueError, IndexError):
+        shp = ()
+    trans = np.asarray(
+        skw.get("translate", getattr(ref_layer, "translate", 0)), dtype=np.float64
+    ).ravel()
+    scale = np.asarray(
+        skw.get("scale", getattr(ref_layer, "scale", 1)), dtype=np.float64
+    ).ravel()
+    if trans.size < 3:
+        trans = np.pad(trans, (3 - trans.size, 0), constant_values=0.0)
+    if scale.size < 3:
+        scale = np.pad(scale, (3 - scale.size, 0), constant_values=1.0)
+    t3 = trans[-3:]
+    s3 = scale[-3:].copy()
+    s3[s3 <= 0] = 1.0
+    if len(shp) >= 3:
+        n3 = np.asarray(shp[-3:], dtype=np.float64)
+    else:
+        n3 = np.ones(3, dtype=np.float64)
+    lo = t3
+    hi = t3 + np.maximum(n3 - 1.0, 0.0) * s3
+    return (
+        (float(lo[0]), float(hi[0])),
+        (float(lo[1]), float(hi[1])),
+        (float(lo[2]), float(hi[2])),
+    )
 
 
 def scaled_spatial_kwargs(

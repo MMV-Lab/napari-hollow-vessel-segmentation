@@ -151,6 +151,8 @@ def compute_upper_threshold(image, method):
         Threshold value above which voxels are rejected during growing.
     """
     arr = np.asarray(image, dtype=np.float64)
+    if method not in {"otsu", "triangle", "li", "p90", "p95"}:
+        raise ValueError(f"Unknown threshold method: {method!r}")
     try:
         if method == "otsu":
             return float(threshold_otsu(arr))
@@ -160,11 +162,9 @@ def compute_upper_threshold(image, method):
             return float(threshold_li(arr))
         if method == "p90":
             return float(np.percentile(arr, 90))
-        if method == "p95":
-            return float(np.percentile(arr, 95))
-        raise ValueError(f"Unknown threshold method: {method!r}")
-    except Exception:
-        # Fallback: 95th percentile is always computable
+        return float(np.percentile(arr, 95))
+    except (ValueError, RuntimeError, IndexError):
+        # Histogram methods fail on constant images; p95 is always computable.
         return float(np.percentile(arr, 95))
 
 
@@ -245,6 +245,15 @@ def region_grow(
     image = np.asarray(image, dtype=np.float64)
     seed_mask = np.asarray(seed_mask, dtype=bool)
     shape = image.shape
+    if seed_mask.shape != shape:
+        raise ValueError(
+            f"seed_mask shape {seed_mask.shape} != image shape {shape}"
+        )
+    if not np.all(np.isfinite(image)):
+        raise ValueError(
+            "image contains NaN/Inf; region growing requires finite values "
+            "(check the loaded pyramid level / contrast)."
+        )
     spacing = _normalize_spacing(spacing, shape)
     mean_s = float(np.mean(spacing))
 
@@ -257,11 +266,19 @@ def region_grow(
             )
         seed_mask = seed_mask & ~forbidden
 
+    if not np.any(seed_mask):
+        raise ValueError(
+            "seed_mask is empty (no seed voxels to grow from). Increase the "
+            "tube radius, check point placement, or verify the blocker mask "
+            "is not covering the seed."
+        )
+
     # ── 1. Pre-compute edge indicator & gradient vector field ───────────
     g, grad, grad_mag, kappa = _precompute_edge_map(image, sigma, spacing)
 
     epsilon = 0.01
     local_cost = 1.0 / (epsilon + g)        # high at edges, ~1 in smooth
+    del g  # edge indicator no longer needed; free a full-volume float array
 
     # ── 2. Auto-calibrate cost budget (physical path length) ───────────
     if cost_budget is None:
@@ -277,10 +294,13 @@ def region_grow(
     axis_idx = end - start
     axis_phys = axis_idx * spacing
     axis_len_phys = float(np.linalg.norm(axis_phys))
-    if axis_len_phys > 1e-10:
-        axis_dir_phys = axis_phys / axis_len_phys
-    else:
-        axis_dir_phys = None
+    if axis_len_phys <= float(np.min(spacing)):
+        raise ValueError(
+            "start_point and end_point coincide (or are within one voxel); the "
+            "vessel-axis length constraint cannot be defined. Place at least two "
+            "distinct branch points."
+        )
+    axis_dir_phys = axis_phys / axis_len_phys
     margin_phys = float(margin) * mean_s
 
     # ── 4. Region mask & Welford running statistics ─────────────────────
@@ -288,8 +308,11 @@ def region_grow(
     if stats_seed_mask is not None:
         stat_mask = np.asarray(stats_seed_mask, dtype=bool)
         if stat_mask.shape != shape:
-            stat_mask = seed_mask
-        elif not np.any(stat_mask):
+            raise ValueError(
+                f"stats_seed_mask shape {stat_mask.shape} != image shape {shape}"
+            )
+        if not np.any(stat_mask):
+            # Empty stats skeleton: fall back to the full seed for statistics.
             stat_mask = seed_mask
     else:
         stat_mask = seed_mask
@@ -434,18 +457,25 @@ def polyline_to_line_mask(shape: tuple, poly_zyx: np.ndarray) -> np.ndarray:
     mask = np.zeros(shape, dtype=bool)
     if poly.shape[0] == 0:
         return mask
-    z, y, x = poly[0]
-    if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
-        mask[z, y, x] = True
     for i in range(poly.shape[0] - 1):
-        a = poly[i]
-        b = poly[i + 1]
+        a = np.asarray(poly[i], dtype=np.int64).ravel()[:3]
+        b = np.asarray(poly[i + 1], dtype=np.int64).ravel()[:3]
         if _line_nd is not None:
             try:
                 idx = _line_nd(a, b, endpoint=True)
             except TypeError:
                 idx = _line_nd(a, b)
-            mask[tuple(idx)] = True
+            # ``line_nd`` can return coordinates outside the volume on some paths;
+            # bulk ``mask[idx] = True`` then raises and skips the segment.  Paint
+            # in-bounds voxels only so face/corner polylines still connect.
+            for j in range(len(idx[0])):
+                vz, vy, vx = int(idx[0][j]), int(idx[1][j]), int(idx[2][j])
+                if (
+                    0 <= vz < shape[0]
+                    and 0 <= vy < shape[1]
+                    and 0 <= vx < shape[2]
+                ):
+                    mask[vz, vy, vx] = True
         else:
             n = int(np.max(np.abs(b - a))) + 1
             for t in np.linspace(0.0, 1.0, max(n, 2)):
@@ -456,6 +486,11 @@ def polyline_to_line_mask(shape: tuple, poly_zyx: np.ndarray) -> np.ndarray:
                     and 0 <= vx < shape[2]
                 ):
                     mask[vz, vy, vx] = True
+    # Guarantee every user knot lies on the centerline (faces / last slice).
+    for k in range(poly.shape[0]):
+        z, y, x = int(poly[k, 0]), int(poly[k, 1]), int(poly[k, 2])
+        if 0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]:
+            mask[z, y, x] = True
     return mask
 
 

@@ -1,8 +1,7 @@
-"""In-memory 3D preprocessing: denoise → contrast stretch.
+"""In-memory contrast-stretch helpers (shared by the OME-Zarr / OME-TIFF CLIs).
 
-Suitable for full volumes or crops. Non-local means denoise can be very slow on
-large arrays. Use the image **Pyramid level** in the widget to work on a coarser
-resolution instead of resampling here.
+Suitable for full volumes or crops. Large 3-D volumes use a slab-wise float32
+path so a full-volume float copy is never allocated.
 """
 
 from __future__ import annotations
@@ -18,40 +17,6 @@ _CONTRAST_PERCENTILE_MAX_SAMPLES = 12_000_000
 _STRETCH_CHUNK_ENTRY_BYTES = 32 * 1024**2
 # Max float32 working set for one (Y,X) slab or tile block (~256 MiB default).
 _STRETCH_FLOAT_BUFFER_BUDGET_BYTES = 256 * 1024**2
-from skimage.restoration import denoise_nl_means
-
-
-def denoise_nl_means_crop(
-    crop: np.ndarray,
-    patch_size: int,
-    patch_distance: int,
-    h: float,
-) -> np.ndarray:
-    """3D non-local means; same normalization contract as extract_crops.denoise_crop."""
-    ps = int(patch_size)
-    if ps % 2 == 0:
-        ps = max(3, ps - 1)
-    dtype = crop.dtype
-    if np.issubdtype(dtype, np.integer):
-        info = np.iinfo(dtype)
-        crop_f = (crop.astype(np.float64) - info.min) / (info.max - info.min + 1e-8)
-    else:
-        crop_f = np.clip(crop.astype(np.float64), 0.0, 1.0)
-    out_f = denoise_nl_means(
-        crop_f,
-        patch_size=ps,
-        patch_distance=int(patch_distance),
-        h=float(h),
-        channel_axis=None,
-    )
-    if np.issubdtype(dtype, np.integer):
-        info = np.iinfo(dtype)
-        out = (np.clip(out_f, 0, 1) * (info.max - info.min) + info.min).round().astype(
-            dtype
-        )
-    else:
-        out = out_f.astype(dtype, copy=False)
-    return out
 
 
 def contrast_range_from_crop(
@@ -185,67 +150,3 @@ def stretch_contrast(
     ):
         return _stretch_contrast_zyx_slabwise(crop, in_min, in_max, out_dtype)
     return _stretch_contrast_dense_float32(crop, in_min, in_max, out_dtype)
-
-
-def spacing_zyx_from_layer(layer: Any) -> Tuple[float, float, float]:
-    """Voxel spacing (Z, Y, X) from napari layer.scale (last three dims)."""
-    sc = np.asarray(layer.scale, dtype=np.float64).ravel()
-    if sc.size < 3:
-        return (1.0, 1.0, 1.0)
-    s = sc[-3:].copy()
-    s[s <= 0] = 1.0
-    return (float(s[0]), float(s[1]), float(s[2]))
-
-
-def apply_preprocess_chain(
-    crop: np.ndarray,
-    spacing_zyx: Tuple[float, float, float],
-    *,
-    apply_denoise: bool,
-    denoise_patch_size: int,
-    denoise_patch_distance: int,
-    denoise_h: float,
-    apply_stretch: bool,
-    stretch_mode: str,
-    percentile_low: float,
-    percentile_high: float,
-    fixed_background: float,
-    fixed_vessel_max: float,
-    out_dtype: str,
-) -> Tuple[np.ndarray, Tuple[float, float, float], Dict[str, Any]]:
-    """Run denoise (optional) then contrast stretch (optional). Returns (array, spacing, meta)."""
-    arr = np.asarray(crop)
-    spacing = spacing_zyx
-    post: Dict[str, Any] = {}
-
-    if apply_denoise:
-        arr = denoise_nl_means_crop(
-            arr,
-            denoise_patch_size,
-            denoise_patch_distance,
-            denoise_h,
-        )
-        post["denoise"] = {
-            "patch_size": int(denoise_patch_size),
-            "patch_distance": int(denoise_patch_distance),
-            "h": float(denoise_h),
-        }
-
-    if apply_stretch:
-        if stretch_mode == "percentile":
-            lo, hi = contrast_range_from_crop(
-                arr, float(percentile_low), float(percentile_high)
-            )
-            extra = {
-                "mode": "percentile",
-                "percentile_low": float(percentile_low),
-                "percentile_high": float(percentile_high),
-            }
-        else:
-            lo, hi = float(fixed_background), float(fixed_vessel_max)
-            extra = {"mode": "fixed"}
-        arr, sinfo = stretch_contrast(arr, lo, hi, out_dtype=out_dtype)
-        sinfo.update(extra)
-        post["contrast_stretch"] = sinfo
-
-    return arr, spacing, post

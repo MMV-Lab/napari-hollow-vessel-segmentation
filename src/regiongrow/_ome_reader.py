@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -214,6 +215,17 @@ def volume_spacing_meta_pre_transpose(
     # ``np.asarray`` can drop the ``memmap`` subclass and break downstream mmap checks;
     # ``asanyarray`` keeps memory-backed subclasses (e.g. slab temp file).
     d, ax = _squeeze_trailing_extras(np.asanyarray(data), axes)
+    # Warn before silently keeping only index 0 of a multi-time / multi-channel stack.
+    ax_u = ax.upper()
+    for letter, label in (("T", "time points"), ("C", "channels")):
+        if letter in ax_u:
+            n = int(d.shape[ax_u.index(letter)])
+            if n > 1:
+                warnings.warn(
+                    f"{path_for_errors.name}: OME-TIFF has {n} {label}; this reader "
+                    "uses index 0 only (single 3-D scalar volume).",
+                    stacklevel=2,
+                )
     d, ax = _collapse_time_and_channel(d, ax)
 
     if d.ndim != 3:
@@ -255,7 +267,12 @@ def read_ome_tiff(path: str | Path) -> List[LayerDataTuple]:
         if not tif.series:
             return []
         series = tif.series[0]
-        data = series.asarray()
+        # Prefer a memory map so multi-GB volumes are not fully loaded into RAM;
+        # tifffile falls back with ValueError for compressed/non-contiguous data.
+        try:
+            data = series.asarray(out="memmap")
+        except (ValueError, MemoryError, NotImplementedError):
+            data = series.asarray()
         axes = series.axes
         omexml = tif.ome_metadata or ""
 

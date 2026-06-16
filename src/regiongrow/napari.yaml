@@ -9,6 +9,9 @@ contributions:
     - id: regiongrow.read_ome_tiff
       python_name: regiongrow._ome_reader:napari_get_reader
       title: Read OME-TIFF with voxel spacing
+    - id: regiongrow.read_omezarr_with_segmentation
+      python_name: regiongrow._omezarr_reader:napari_get_reader
+      title: Read OME-Zarr + segmentation labels
     - id: regiongrow.sample_data
       python_name: regiongrow._sample_data:make_sample_vessel
       title: Synthetic Hollow Vessel
@@ -18,6 +21,10 @@ contributions:
         - '*.ome.tif'
         - '*.ome.tiff'
       accepts_directories: false
+    - command: regiongrow.read_omezarr_with_segmentation
+      filename_patterns:
+        - '*.ome.zarr'
+      accepts_directories: true
   widgets:
     - command: regiongrow.make_widget
       display_name: Region Grow Vessel Segmentation

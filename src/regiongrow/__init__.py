@@ -2,24 +2,34 @@
 
 __version__ = "0.1.0"
 
-# Suppress "leaked semaphore" warnings on macOS.  These are caused by
-# Python's multiprocessing resource_tracker being overly strict when
-# napari / Qt spins up worker threads that import multiprocessing
-# indirectly.  Setting the start method to "fork" (macOS default for
-# Python < 3.14) avoids the resource_tracker entirely; on other
-# platforms this is harmless.
-import multiprocessing as _mp
 import sys as _sys
-import warnings as _warnings
 
-if _sys.platform == "darwin":
+_MACOS_WORKAROUND_INSTALLED = False
+
+
+def apply_macos_multiprocessing_workaround() -> None:
+    """Suppress macOS false-positive "leaked semaphore" warnings.
+
+    Python's multiprocessing ``resource_tracker`` over-reports leaked
+    semaphores from framework internals when napari/Qt spins up worker
+    threads. This patches the process-global tracker, so it is applied
+    **lazily** (only when the widget is constructed) rather than at import
+    time, to avoid imposing a global side effect on the whole napari process
+    for plugins that are merely discovered but never opened. Idempotent.
+    """
+    global _MACOS_WORKAROUND_INSTALLED
+    if _MACOS_WORKAROUND_INSTALLED or _sys.platform != "darwin":
+        return
+    _MACOS_WORKAROUND_INSTALLED = True
+
+    import multiprocessing as _mp
+    import warnings as _warnings
+
     try:
         _mp.set_start_method("fork", force=False)
     except RuntimeError:
         pass  # already set — ignore
 
-    # Some macOS/Python combinations over-report leaked semaphores from
-    # framework internals; avoid tracking semaphore resources entirely.
     try:
         from multiprocessing import resource_tracker as _resource_tracker
 
@@ -41,8 +51,6 @@ if _sys.platform == "darwin":
     except Exception:
         pass
 
-    # Python 3.11 on macOS may report false-positive leaked semaphore
-    # warnings at interpreter shutdown when GUI/thread pools are active.
     _warnings.filterwarnings(
         "ignore",
         message=(

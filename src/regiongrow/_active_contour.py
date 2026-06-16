@@ -25,83 +25,16 @@ Reference:
   surfaces", IEEE TPAMI 2014.
 """
 
-from itertools import cycle
 from typing import Optional
 
 import numpy as np
 from scipy import ndimage as ndi
-from scipy.ndimage import distance_transform_edt, generate_binary_structure, binary_dilation
-from skimage.segmentation import morphsnakes as _msm
+from scipy.ndimage import distance_transform_edt
 
-
-# 3×3×3 plane structuring elements (same as skimage.segmentation.morphsnakes._P3).
-_MGAC_P3 = [np.zeros((3, 3, 3), dtype=np.int8) for _ in range(9)]
-_MGAC_P3[0][:, :, 1] = 1
-_MGAC_P3[1][:, 1, :] = 1
-_MGAC_P3[2][1, :, :] = 1
-_MGAC_P3[3][:, [0, 1, 2], [0, 1, 2]] = 1
-_MGAC_P3[4][:, [0, 1, 2], [2, 1, 0]] = 1
-_MGAC_P3[5][[0, 1, 2], :, [0, 1, 2]] = 1
-_MGAC_P3[6][[0, 1, 2], :, [2, 1, 0]] = 1
-_MGAC_P3[7][[0, 1, 2], [0, 1, 2], :] = 1
-_MGAC_P3[8][[0, 1, 2], [2, 1, 0], :] = 1
-
-
-def _sup_inf_edgesafe(u: np.ndarray) -> np.ndarray:
-    """SI operator with boundary-safe erosions (see :func:`_curvop_edgesafe`)."""
-    erosions = []
-    for P_i in _MGAC_P3:
-        try:
-            erosions.append(
-                ndi.binary_erosion(u, P_i, border_value=1).astype(np.int8)
-            )
-        except TypeError:  # older scipy without border_value
-            erosions.append(ndi.binary_erosion(u, P_i).astype(np.int8))
-    return np.stack(erosions, axis=0).max(0)
-
-
-def _inf_sup_edgesafe(u: np.ndarray) -> np.ndarray:
-    """IS operator (dilations unchanged at borders)."""
-    dilations = []
-    for P_i in _MGAC_P3:
-        dilations.append(ndi.binary_dilation(u, P_i).astype(np.int8))
-    return np.stack(dilations, axis=0).min(0)
-
-
-_curvop_edgesafe_fns = cycle(
-    [
-        lambda u: _sup_inf_edgesafe(_inf_sup_edgesafe(u)),
-        lambda u: _inf_sup_edgesafe(_sup_inf_edgesafe(u)),
-    ]
-)
-
-
-def _curvop_edgesafe(u: np.ndarray) -> np.ndarray:
-    """Morphological curvature like ``morphsnakes._curvop`` without edge shrink.
-
-    Default ``binary_erosion(..., border_value=0)`` treats voxels outside the
-    volume as background, so repeated SI/IS curvature steps erode the level set
-    several voxels in from every face. Using ``border_value=1`` for erosions
-    only matches an absorbing “outside is foreground” boundary so the contour
-    can reach the image extent.
-    """
-    return next(_curvop_edgesafe_fns)(u)
+from ._algorithm import _normalize_spacing
 
 
 # ─────────────────────────── helpers ─────────────────────────────────────── #
-
-
-def _normalize_spacing(spacing, shape):
-    if spacing is None:
-        return np.ones(3, dtype=np.float64)
-    s = np.asarray(spacing, dtype=np.float64).ravel()
-    if s.size == 1:
-        s = np.broadcast_to(s, (3,))
-    if s.size < 3:
-        s = np.pad(s, (0, 3 - s.size), constant_values=1.0)
-    s = s[-3:].copy()
-    s[s <= 0] = 1.0
-    return s
 
 
 def _inverse_gaussian_gradient_physical(image, alpha, sigma, spacing):
@@ -348,6 +281,7 @@ def active_contour_grow(
     total_iter=200,     # total evolution iterations
     # ── animation ──
     yield_every=5,      # iterations between display updates
+    early_stop_stable_yields=2,  # stop after this many yields with an unchanged mask
     # ── geometry ──
     margin=5.0,
     blocker_mask=None,
@@ -382,6 +316,9 @@ def active_contour_grow(
         Total number of MGAC iterations.
     yield_every : int
         Iterations between animation-frame yields.
+    early_stop_stable_yields : int
+        Stop early after this many consecutive display updates with an
+        identical boolean mask (0 disables).
     margin : float
         Physical slack ``margin * mean(spacing)`` along the vessel axis.
     blocker_mask : bool ndarray, optional
@@ -406,6 +343,11 @@ def active_contour_grow(
         Iteration counter and current boolean segmentation mask.
     """
     image = np.asarray(image, dtype=np.float64)
+    if not np.all(np.isfinite(image)):
+        raise ValueError(
+            "image contains NaN/Inf; active-contour growing requires finite "
+            "values (check the loaded pyramid level / contrast)."
+        )
     # Optionally flatten lumen/background: treat all values <= threshold as 0
     # so tiny intensity variations do not create micro-gradients and pinholes.
     thr0 = float(low_intensity_equalize_below)
@@ -457,6 +399,8 @@ def active_contour_grow(
 
     steps_done = 0
     outer_steps = max(1, (total_iter + yield_every - 1) // yield_every)
+    stable_yields = 0
+    ls_prev: Optional[np.ndarray] = None
     # NOTE: This plugin now focuses on segmenting one branch at a time.
     # The earlier "balloon-first warmup" made the contour aggressively search for
     # new branches and could leak through small wall holes. We therefore always
@@ -493,6 +437,15 @@ def active_contour_grow(
 
         steps_done += iters_this
         yield steps_done, ls.copy()
+
+        if early_stop_stable_yields > 0 and ls_prev is not None and ls.shape == ls_prev.shape:
+            if np.array_equal(ls, ls_prev):
+                stable_yields += 1
+                if stable_yields >= int(early_stop_stable_yields):
+                    break
+            else:
+                stable_yields = 0
+        ls_prev = ls.copy()
 
         if steps_done >= total_iter:
             break

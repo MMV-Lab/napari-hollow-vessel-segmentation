@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Session cache: (layer name, pyramid level, dtype name, data id) → full-level array.
+# The data-id component invalidates the entry automatically when a layer's data
+# is replaced (the backing array object changes) while keeping it valid across
+# renames (same array object), which matches the user's intent.
+CacheKey = Tuple[str, int, str, int]
+_IMAGE_LEVEL_CACHE: Dict[CacheKey, np.ndarray] = {}
+_IMAGE_LEVEL_CACHE_ORDER: List[CacheKey] = []
+# Default ~6 GB; evict oldest levels when exceeded (grow + 3D display share this cache).
+_IMAGE_LEVEL_CACHE_MAX_BYTES = int(6e9)
 
 try:
     import dask.array as da
@@ -77,6 +87,15 @@ def layer_data_shape(layer: Any) -> Tuple[int, ...]:
     return _arraylike_shape(d)
 
 
+def image_level_data(layer: Any, level: int = 0) -> Any:
+    """Array-like data at *level* without materializing lazy stores."""
+    levels = _multiscale_levels_data(layer)
+    if levels is not None:
+        idx = int(np.clip(level, 0, len(levels) - 1))
+        return _unwrap_data_element(levels[idx])
+    return getattr(layer, "data", None)
+
+
 def image_level_shape(layer: Any, level: int = 0) -> Tuple[int, ...]:
     """Shape of *layer*'s data at *level* (0 = finest for napari multiscale)."""
     levels = _multiscale_levels_data(layer)
@@ -92,8 +111,142 @@ def image_level_shape(layer: Any, level: int = 0) -> Tuple[int, ...]:
     return tuple(np.asarray(d).shape)
 
 
+def labels_pyramid_level_for_image_level(
+    labels_layer: Any, image_layer: Any, image_level: int
+) -> int:
+    """Pick the labels pyramid index whose grid matches *image_level*."""
+    try:
+        target = tuple(int(x) for x in image_level_shape(image_layer, int(image_level)))
+    except (TypeError, ValueError, IndexError):
+        return 0
+    if len(target) != 3:
+        return 0
+    levels = _multiscale_levels_data(labels_layer)
+    if levels is None:
+        return 0
+    for idx in range(len(levels)):
+        try:
+            shp = tuple(int(x) for x in image_level_shape(labels_layer, idx))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if shp == target:
+            return int(idx)
+    return int(np.clip(int(image_level), 0, len(levels) - 1))
+
+
+def materialize_labels_level(layer: Any, level: int = 0) -> np.ndarray:
+    """Dense snapshot of a Labels layer at multiscale *level* (0 = finest).
+
+  ``np.asarray(labels_layer.data)`` on multiscale labels returns the **coarsest**
+    level in napari — never use that for saving the edited mask.
+    """
+    block = image_level_data(layer, int(level))
+    if block is None:
+        return np.asarray(getattr(layer, "data", np.zeros(1, dtype=np.uint8)))
+    if is_lazy_array(block):
+        if da is not None and isinstance(block, da.Array):
+            return np.asarray(block.compute())
+        return np.asarray(block)
+    return np.asarray(block)
+
+
 def image_finest_shape(layer: Any) -> Tuple[int, ...]:
     return image_level_shape(layer, 0)
+
+
+def finest_labels_data_shape(labels_data: Any) -> Tuple[int, ...]:
+    """Shape (…, Z, Y, X) of the finest grid in saved / napari multiscale labels data."""
+    if isinstance(labels_data, (list, tuple)):
+        if not labels_data:
+            return tuple()
+        return _arraylike_shape(labels_data[0])
+    return _arraylike_shape(labels_data)
+
+
+def image_level_index_for_shape(
+    image_layer: Any, shape: Tuple[int, ...]
+) -> Optional[int]:
+    """Pyramid level whose grid matches *shape* (exact, else closest ZYX size)."""
+    tgt = tuple(int(x) for x in shape)
+    if len(tgt) < 3:
+        return None
+    tgt3 = tuple(int(x) for x in tgt[-3:])
+    best_lvl: Optional[int] = None
+    best_score = float("inf")
+    for lvl in range(multiscale_level_count(image_layer)):
+        try:
+            shp = tuple(int(x) for x in image_level_shape(image_layer, lvl))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if len(shp) < 3:
+            continue
+        shp3 = tuple(int(x) for x in shp[-3:])
+        if shp3 == tgt3:
+            return int(lvl)
+        score = sum(
+            abs(
+                float(np.log(max(int(a), 1)))
+                - float(np.log(max(int(b), 1)))
+            )
+            for a, b in zip(shp3, tgt3)
+        )
+        if score < best_score:
+            best_score = score
+            best_lvl = int(lvl)
+    return best_lvl
+
+
+def _level_downsample_factors(
+    layer: Any,
+    level: int,
+    level_shape: Optional[Tuple[int, ...]] = None,
+) -> Tuple[float, float, float]:
+    """Per-axis (Z, Y, X) downsample factors of *level* relative to finest.
+
+    Single source of truth for pyramid geometry: prefer napari
+    ``layer.downsample_factors`` (what the canvas and coordinate transforms use)
+    and fall back to the finest/level shape ratio only when factors are missing.
+    Keeping spacing, slider steps, and polyline mapping on the same factors
+    avoids divergence on padded / non-uniform pyramids.
+    """
+    level = int(level)
+    if level <= 0:
+        return (1.0, 1.0, 1.0)
+    if is_multiscale_image_layer(layer):
+        try:
+            df = np.asarray(
+                layer.downsample_factors[level], dtype=np.float64
+            ).ravel()
+            if df.size >= 3:
+                df3 = df[-3:].copy()
+            else:
+                df3 = np.ones(3, dtype=np.float64)
+                df3[-df.size :] = df
+            df3[df3 <= 0] = 1.0
+            return (float(df3[0]), float(df3[1]), float(df3[2]))
+        except (AttributeError, IndexError, TypeError, ValueError):
+            pass
+    finest = image_finest_shape(layer)
+    work = level_shape if level_shape is not None else image_level_shape(layer, level)
+    if len(finest) >= 3 and len(work) >= 3:
+        return (
+            float(finest[-3]) / max(int(work[-3]), 1),
+            float(finest[-2]) / max(int(work[-2]), 1),
+            float(finest[-1]) / max(int(work[-1]), 1),
+        )
+    return (1.0, 1.0, 1.0)
+
+
+def pyramid_axis_steps(layer: Any, level: int) -> Tuple[int, int, int]:
+    """Finest-voxel steps per Z,Y,X so one slider tick crosses one working-level voxel.
+
+    At coarse pyramid levels each displayed slice spans several finest indices
+    (block subsampling). Use these steps with napari ``dims.set_range(..., step)``.
+    """
+    if int(level) <= 0:
+        return (1, 1, 1)
+    fz, fy, fx = _level_downsample_factors(layer, int(level))
+    return (max(1, int(round(fz))), max(1, int(round(fy))), max(1, int(round(fx))))
 
 
 def is_lazy_array(x: Any) -> bool:
@@ -135,17 +288,17 @@ def voxel_spacing_zyx_for_level(
     level: int,
     level_shape: Tuple[int, int, int],
 ) -> Tuple[float, float, float]:
-    """Physical spacing (Z, Y, X) matching *level_shape* (finest scale × size ratio)."""
+    """Physical spacing (Z, Y, X) at *level*, using napari downsample factors.
+
+    Derived from the finest ``layer.scale`` times the per-axis pyramid
+    downsample factors (with a shape-ratio fallback), so physical tube radius
+    and axis margins at coarse levels match the displayed pyramid geometry.
+    """
     sz0, sy0, sx0 = voxel_spacing_zyx_finest(layer)
-    if not is_multiscale_image_layer(layer):
+    if not is_multiscale_image_layer(layer) or int(level) <= 0:
         return (sz0, sy0, sx0)
-    finest = image_finest_shape(layer)
-    if len(finest) != 3 or len(level_shape) != 3:
-        return (sz0, sy0, sx0)
-    rz = finest[0] / max(level_shape[0], 1)
-    ry = finest[1] / max(level_shape[1], 1)
-    rx = finest[2] / max(level_shape[2], 1)
-    return (sz0 * rz, sy0 * ry, sx0 * rx)
+    fz, fy, fx = _level_downsample_factors(layer, int(level), level_shape)
+    return (sz0 * fz, sy0 * fy, sx0 * fx)
 
 
 def tube_radius_voxels_for_work_level(
@@ -199,6 +352,50 @@ def axis_margin_voxels_for_work_level(
     return m * (mean_f / mean_w)
 
 
+def _image_level_cache_touch(key: CacheKey) -> None:
+    try:
+        _IMAGE_LEVEL_CACHE_ORDER.remove(key)
+    except ValueError:
+        pass
+    _IMAGE_LEVEL_CACHE_ORDER.append(key)
+
+
+def _image_level_cache_evict_if_needed() -> None:
+    total = sum(int(a.nbytes) for a in _IMAGE_LEVEL_CACHE.values())
+    while total > _IMAGE_LEVEL_CACHE_MAX_BYTES and _IMAGE_LEVEL_CACHE_ORDER:
+        old = _IMAGE_LEVEL_CACHE_ORDER.pop(0)
+        arr = _IMAGE_LEVEL_CACHE.pop(old, None)
+        if arr is not None:
+            total -= int(arr.nbytes)
+
+
+def clear_image_level_cache() -> None:
+    """Drop all cached pyramid levels (e.g. when closing the widget)."""
+    _IMAGE_LEVEL_CACHE.clear()
+    _IMAGE_LEVEL_CACHE_ORDER.clear()
+
+
+def invalidate_image_level_cache(layer_name: str) -> None:
+    """Remove cached levels for one image layer name."""
+    drop = [k for k in _IMAGE_LEVEL_CACHE if k[0] == layer_name]
+    for k in drop:
+        del _IMAGE_LEVEL_CACHE[k]
+        try:
+            _IMAGE_LEVEL_CACHE_ORDER.remove(k)
+        except ValueError:
+            pass
+
+
+def _image_level_cache_key(layer: Any, level: int, dtype: Optional[Any]) -> CacheKey:
+    name = str(getattr(layer, "name", id(layer)))
+    dname = "raw" if dtype is None else str(np.dtype(dtype))
+    try:
+        data_id = id(image_level_data(layer, int(level)))
+    except Exception:
+        data_id = 0
+    return (name, int(level), dname, data_id)
+
+
 def materialize_image_level(
     layer: Any,
     level: int,
@@ -229,6 +426,43 @@ def materialize_image_level(
     return np.asarray(block, dtype=dtype)
 
 
+def materialize_image_level_cached(
+    layer: Any,
+    level: int,
+    dtype: Optional[Any] = np.float32,
+    *,
+    slices: Optional[Tuple[slice, ...]] = None,
+    use_cache: bool = True,
+) -> np.ndarray:
+    """Materialize with optional session cache of the full pyramid level.
+
+    When *slices* is set, returns only that subvolume. If the full level is
+    already cached, slices are taken from RAM; otherwise only the ROI is read
+    from the backing store (no full-volume decode).
+    """
+    if not use_cache:
+        return materialize_image_level(layer, level, dtype=dtype, slices=slices)
+
+    key = _image_level_cache_key(layer, level, dtype)
+    if key in _IMAGE_LEVEL_CACHE:
+        _image_level_cache_touch(key)
+        full = _IMAGE_LEVEL_CACHE[key]
+        # Copy on return so a consumer (grow worker / 3D display) that mutates or
+        # hands the array to napari cannot corrupt the shared cached master.
+        if slices is None:
+            return np.array(full, copy=True)
+        return np.asarray(full[slices], dtype=full.dtype if dtype is None else dtype)
+
+    if slices is not None:
+        return materialize_image_level(layer, level, dtype=dtype, slices=slices)
+
+    arr = materialize_image_level(layer, level, dtype=dtype)
+    _IMAGE_LEVEL_CACHE[key] = arr
+    _image_level_cache_touch(key)
+    _image_level_cache_evict_if_needed()
+    return arr
+
+
 def check_materialization_budget(
     shape: Tuple[int, ...],
     dtype: Any,
@@ -250,6 +484,14 @@ def check_materialization_budget(
     return None
 
 
-def multiscale_level_label(layer: Any, level: int) -> str:
+def multiscale_level_label(layer: Any, level: int, *, include_shape: bool = False) -> str:
+    """Short label for dock combos; full shape via :func:`multiscale_level_tooltip`."""
+    if not include_shape:
+        return f"Level {level}"
     shp = image_level_shape(layer, level)
     return f"Level {level} — shape {shp}"
+
+
+def multiscale_level_tooltip(layer: Any, level: int) -> str:
+    shp = image_level_shape(layer, level)
+    return f"Pyramid level {level}, shape Z×Y×X = {tuple(int(x) for x in shp)}"

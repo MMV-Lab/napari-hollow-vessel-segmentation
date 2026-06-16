@@ -4,38 +4,57 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "regiongrow"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A napari plugin for 3D vessel segmentation using region growing"
-requires-python = ">=3.9"
+readme = "README.md"
 license = "BSD-3-Clause"
+requires-python = ">=3.10"
+authors = [
+    { name = "Microscopy Machine Vision Group" },
+]
+keywords = ["napari", "segmentation", "vessel", "OME-Zarr", "microscopy", "3D"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Operating System :: OS Independent",
+]
 dependencies = [
-    "napari[all]",
-    "pandas>=1.3",
-    "numpy",
-    "scipy",
-    "scikit-image",
-    "scikit-fmm",
-    "tifffile",
-    "magicgui",
+    # napari is expected in the host environment; depend on it (no heavy ``[all]``
+    # extra) plus qtpy, following napari plugin packaging convention. Install a Qt
+    # backend (e.g. ``pip install napari[all]``) to run napari standalone.
+    "napari>=0.4.19",
     "qtpy",
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "scikit-image>=0.20,<0.26",
+    "tifffile>=2022.5.4",
+    "pandas>=1.3",
+    # OME-Zarr read/save and the merge autosave are core plugin features (declared
+    # in napari.yaml), so their Zarr stack must be a core dependency, not optional.
+    "zarr>=2.14",
+    "ome-zarr>=0.8",
+    "numcodecs",
+    "dask[array]",
 ]
 
 [project.optional-dependencies]
-zarr-cli = [
-    "ome-zarr>=0.8",
-    "zarr>=2.14",
-    "numcodecs",
-    "dask[array]",
-]
 # OME-TIFF → OME-Zarr via BioIO + OMEZarrWriter (``regiongrow-convert-to-ome-zarr``).
+# The BioIO writer path requires Python >= 3.11.
 zarr-cli-bioio = [
-    "ome-zarr>=0.8",
-    "zarr>=2.14",
-    "numcodecs",
-    "dask[array]",
     "bioio>=3",
     "bioio-ome-tiff>=1.0",
     "bioio-ome-zarr>=3",
+]
+test = [
+    "pytest>=7",
+    "pytest-qt",
 ]
 
 [project.scripts]
@@ -46,8 +65,14 @@ regiongrow-preprocess-ome-tiff = "regiongrow.cli.preprocess_ome_tiff:main"
 [project.entry-points."napari.manifest"]
 regiongrow = "regiongrow:napari.yaml"
 
+[tool.setuptools.dynamic]
+version = { attr = "regiongrow.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 regiongrow = ["napari.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
