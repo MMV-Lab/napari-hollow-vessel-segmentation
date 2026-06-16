@@ -87,6 +87,65 @@ def _per_level_chunks_explicit(
     ]
 
 
+def _max_on_disk_chunk_bytes(
+    chunk_shapes_per_level: Sequence[Sequence[int]],
+    dtype: np.dtype,
+) -> int:
+    """Largest decoded Zarr chunk in bytes across pyramid levels."""
+    itemsize = int(np.dtype(dtype).itemsize)
+    if not chunk_shapes_per_level:
+        return 16 << 20
+    return max(int(np.prod(c)) * itemsize for c in chunk_shapes_per_level)
+
+
+def _dask_array_chunk_size_limit(
+    chunk_shapes_per_level: Sequence[Sequence[int]],
+    dtype: np.dtype,
+) -> int:
+    """``dask.config`` ``array.chunk-size`` for safe aligned Zarr writes."""
+    nbytes = _max_on_disk_chunk_bytes(chunk_shapes_per_level, dtype)
+    # BioIO / Dask warn when below the largest on-disk chunk (~16 MiB viz default).
+    return max(16 << 20, nbytes + 4096)
+
+
+def _chunk_shapes_for_levels(
+    level_shapes: List[Tuple[int, ...]],
+    dtype: np.dtype,
+    memory_target: int,
+    *,
+    chunks: Optional[str],
+    level0_shape: Tuple[int, ...],
+    viz_level_shapes: Optional[List[Tuple[int, ...]]] = None,
+) -> List[Tuple[int, ...]]:
+    """Per-pyramid-level Zarr chunk shapes (always level-aware)."""
+    from bioio_ome_zarr.writers.utils import multiscale_chunk_size_from_memory_target
+
+    if chunks is not None:
+        base_chunk = _chunks_tuple_from_user(chunks, len(level0_shape))
+        return _per_level_chunks_explicit(base_chunk, level_shapes)
+
+    if viz_level_shapes is not None and list(level_shapes) == [
+        tuple(int(x) for x in s) for s in viz_level_shapes
+    ]:
+        # BioIO viz preset: ~16 MiB target, recomputed per pyramid level.
+        return [
+            tuple(
+                int(x)
+                for x in multiscale_chunk_size_from_memory_target(
+                    [shp], dtype, memory_target
+                )[0]
+            )
+            for shp in level_shapes
+        ]
+
+    chunks_per_level = multiscale_chunk_size_from_memory_target(
+        level_shapes,
+        dtype,
+        memory_target,
+    )
+    return [tuple(int(x) for x in c) for c in chunks_per_level]
+
+
 def _ngff_axis_name(bioio_dim: str) -> str:
     key = str(bioio_dim).strip()
     if key in _BIOIO_TO_NGFF_AXIS:
@@ -316,7 +375,6 @@ def convert_image_to_omezarr(
     import dask
     from bioio import BioImage
     from bioio_ome_zarr.writers import OMEZarrWriter, get_default_config_for_viz
-    from bioio_ome_zarr.writers.utils import multiscale_chunk_size_from_memory_target
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -355,30 +413,26 @@ def convert_image_to_omezarr(
         int(np.ceil(float(chunk_target_mib) * 1024 * 1024)),
     )
 
-    if chunks is not None:
-        base_chunk = _chunks_tuple_from_user(chunks, len(level0_shape))
-        chunk_shapes_per_level = _per_level_chunks_explicit(base_chunk, level_shapes)
-        chunk_bytes = max(
-            int(np.prod(c)) * dtype.itemsize for c in chunk_shapes_per_level
-        )
-        chunk_kw: dict = {"chunk_shape": chunk_shapes_per_level}
-    elif num_levels == 3 and abs(float(chunk_target_mib) - 16.0) < 1e-6:
-        level_shapes = viz_config["level_shapes"]
-        chunk_kw = {"chunk_shape": viz_config["chunk_shape"]}
-        chunk_bytes = int(np.prod(viz_config["chunk_shape"])) * dtype.itemsize
-    else:
-        chunks_per_level = multiscale_chunk_size_from_memory_target(
-            level_shapes,
-            dtype,
-            memory_target,
-        )
-        chunk_shapes_per_level = [tuple(int(x) for x in c) for c in chunks_per_level]
-        chunk_bytes = max(
-            int(np.prod(c)) * dtype.itemsize for c in chunk_shapes_per_level
-        )
-        chunk_kw = {"chunk_shape": chunk_shapes_per_level}
-
-    min_chunk = max(16 * 1024 * 1024, int(chunk_bytes))
+    use_viz_shapes = (
+        chunks is None
+        and num_levels == 3
+        and abs(float(chunk_target_mib) - 16.0) < 1e-6
+    )
+    viz_level_shapes = (
+        [tuple(int(x) for x in s) for s in viz_config["level_shapes"]]
+        if use_viz_shapes
+        else None
+    )
+    chunk_shapes_per_level = _chunk_shapes_for_levels(
+        level_shapes,
+        dtype,
+        memory_target,
+        chunks=chunks,
+        level0_shape=level0_shape,
+        viz_level_shapes=viz_level_shapes,
+    )
+    chunk_kw: dict = {"chunk_shape": chunk_shapes_per_level}
+    dask_chunk_limit = _dask_array_chunk_size_limit(chunk_shapes_per_level, dtype)
 
     writer = OMEZarrWriter(
         store=str(output_path),
@@ -388,7 +442,8 @@ def convert_image_to_omezarr(
         **meta_kw,
         **chunk_kw,
     )
-    with dask.config.set({"array.chunk-size": min_chunk}):
+    writer._initialize()
+    with dask.config.set({"array.chunk-size": dask_chunk_limit}):
         writer.write_full_volume(img_xr.data)
 
 

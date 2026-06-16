@@ -71,3 +71,34 @@ def test_ngff_writer_kwargs_multichannel() -> None:
     )
     assert kw["axes_names"][0] == "c"
     assert len(kw["channels"]) == 3
+
+
+def test_dask_chunk_limit_covers_portal_like_level1_chunk() -> None:
+    from regiongrow._bioio_to_omezarr import (
+        _dask_array_chunk_size_limit,
+        _max_on_disk_chunk_bytes,
+    )
+
+    # Portal-scale level 1 from bioio 16 MiB target (uint16).
+    chunks = [(1, 1153, 7270), (1, 2307, 3635), (2, 1818, 1818)]
+    dtype = np.dtype(np.uint16)
+    nbytes = _max_on_disk_chunk_bytes(chunks, dtype)
+    assert nbytes == 16_771_890
+    assert _dask_array_chunk_size_limit(chunks, dtype) >= nbytes
+
+
+def test_chunk_shapes_recomputed_per_pyramid_level() -> None:
+    from regiongrow._bioio_to_omezarr import _chunk_shapes_for_levels
+
+    level_shapes = [(530, 7270, 7270), (265, 3635, 3635), (133, 1818, 1818)]
+    dtype = np.dtype(np.uint16)
+    chunks = _chunk_shapes_for_levels(
+        level_shapes,
+        dtype,
+        16 << 20,
+        chunks=None,
+        level0_shape=level_shapes[0],
+        viz_level_shapes=level_shapes,
+    )
+    assert len(chunks) == 3
+    assert chunks[1][1] == 2307
