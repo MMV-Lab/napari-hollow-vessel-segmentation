@@ -25,6 +25,12 @@ import numpy as np
 import zarr
 
 from regiongrow._preprocessing import contrast_range_from_crop, stretch_contrast
+from regiongrow._zarr_compat import (
+    zarr_create_array,
+    zarr_format_of,
+    zarr_numcodecs_blosc_like_input,
+    zarr_output_codec_kwargs,
+)
 
 try:
     from numcodecs import Blosc
@@ -123,21 +129,8 @@ def _stretch_block(block: np.ndarray, lo: float, hi: float, out_dtype_str: str) 
 
 
 def _output_blosc_compressor(arr_in: zarr.Array) -> Optional[Any]:
-    """Match input Blosc settings when possible; else zstd/clevel=3/bitshuffle."""
-    if Blosc is None:
-        return None
-    c = getattr(arr_in, "compressor", None)
-    if c is not None and hasattr(c, "cname"):
-        try:
-            sh = getattr(c, "shuffle", Blosc.BITSHUFFLE)
-            return Blosc(
-                cname=str(c.cname),
-                clevel=int(getattr(c, "clevel", 3)),
-                shuffle=sh,
-            )
-        except (TypeError, ValueError):
-            pass
-    return Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    """Match input Blosc settings when possible; else zstd/clevel=3/bitshuffle (v2 only)."""
+    return zarr_numcodecs_blosc_like_input(arr_in)
 
 
 def _finest_scale_from_group(g: zarr.Group) -> Tuple[float, float, float]:
@@ -490,22 +483,8 @@ def run_preprocess_zarr_pipeline(
     post: Dict[str, Any] = {}
     finest_path = str(ds_list[0]["path"])
 
-    zfmt = int(getattr(getattr(gin, "metadata", None), "zarr_format", None) or 2)
-    zfmt = 2 if zfmt not in (2, 3) else zfmt
-    _ds_kw: Dict[str, Any] = {}
-    if zfmt == 2 and Blosc is not None:
-        c = _output_blosc_compressor(arr_in)
-        if c is not None:
-            _ds_kw["compressor"] = c
-    elif zfmt == 3:
-        try:
-            from zarr.codecs import BloscCodec, BloscShuffle
-
-            _ds_kw["compressors"] = [
-                BloscCodec(cname="zstd", clevel=3, shuffle=BloscShuffle.bitshuffle)
-            ]
-        except ImportError:
-            pass
+    zfmt = zarr_format_of(gin)
+    _ds_kw = zarr_output_codec_kwargs(arr_in, zfmt=zfmt)
 
     root = zarr.open_group(str(outp), mode="w", zarr_format=zfmt)
     work: zarr.Array
@@ -518,7 +497,8 @@ def run_preprocess_zarr_pipeline(
         new_spacing = (spacing[0] * fz, spacing[1] * fxy, spacing[2] * fxy)
         cz, cy, cx = arr_in.chunks
         out_chunks = (max(1, cz // fz), max(1, cy // fxy), max(1, cx // fxy))
-        work = root.create_dataset(
+        work = zarr_create_array(
+            root,
             work_name,
             shape=(nz, ny, nx),
             chunks=out_chunks,
@@ -548,7 +528,8 @@ def run_preprocess_zarr_pipeline(
             lo, hi = float(fixed_background), float(fixed_vessel_max)
             post["contrast_stretch"] = {"mode": "fixed", "input_min": lo, "input_max": hi}
         od: Any = np.uint16 if out_dtype == "uint16" else np.uint8
-        work = root.create_dataset(
+        work = zarr_create_array(
+            root,
             finest_path,
             shape=(Z, Y, X),
             chunks=tuple(int(c) for c in arr_in.chunks),
@@ -598,7 +579,8 @@ def run_preprocess_zarr_pipeline(
         )
         return post
     else:
-        work = root.create_dataset(
+        work = zarr_create_array(
+            root,
             work_name,
             shape=(Z, Y, X),
             chunks=tuple(int(c) for c in arr_in.chunks),
@@ -624,10 +606,11 @@ def run_preprocess_zarr_pipeline(
             lo, hi = float(fixed_background), float(fixed_vessel_max)
             post["contrast_stretch"] = {"mode": "fixed", "input_min": lo, "input_max": hi}
         od = np.uint16 if out_dtype == "uint16" else np.uint8
-        s0 = root.create_dataset(
+        s0 = zarr_create_array(
+            root,
             finest_path,
-            shape=work.shape,
-            chunks=work.chunks,
+            shape=tuple(int(x) for x in work.shape),
+            chunks=tuple(int(c) for c in work.chunks),
             dtype=od,
             **_ds_kw,
         )
@@ -723,7 +706,8 @@ def _fill_pyramid_coarse_levels(
         if not isinstance(tpl, zarr.Array):
             continue
         ch = tuple(int(c) for c in tpl.chunks)
-        out = root.create_dataset(
+        out = zarr_create_array(
+            root,
             str(path),
             shape=tuple(int(x) for x in tpl.shape),
             chunks=ch,

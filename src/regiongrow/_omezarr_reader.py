@@ -72,11 +72,16 @@ def _label_group_level_shapes(
     """Map pyramid keys → shapes for ``labels/<name>`` without decoding arrays."""
     import zarr
 
+    from regiongrow._zarr_compat import zarr_array_keys
+
     path = resolve_omezarr_store_root(Path(store))
     try:
         root = zarr.open_group(str(path), mode="r")
         lg = root["labels"][name]
-        keys = sorted(lg.array_keys(), key=lambda k: int(k) if str(k).isdigit() else k)
+        keys = sorted(
+            zarr_array_keys(lg),
+            key=lambda k: int(k) if str(k).isdigit() else k,
+        )
     except _ZARR_IO_ERRORS:
         return {}
     shapes: Dict[str, Tuple[int, ...]] = {}
@@ -162,6 +167,8 @@ def _label_group_names_on_disk(store: str | Path) -> List[str]:
     """Subgroup names under ``labels/`` that look like readable NGFF label groups."""
     import zarr
 
+    from regiongrow._zarr_compat import zarr_subgroup_keys
+
     path = resolve_omezarr_store_root(Path(store))
     try:
         root = zarr.open_group(str(path), mode="r")
@@ -171,7 +178,7 @@ def _label_group_names_on_disk(store: str | Path) -> List[str]:
     if labels_grp is None:
         return []
     try:
-        keys = list(labels_grp.group_keys())  # type: ignore[no-untyped-call]
+        keys = zarr_subgroup_keys(labels_grp)
     except _ZARR_IO_ERRORS:
         return []
     out: List[str] = []
@@ -531,6 +538,8 @@ def materialize_saved_labels_at_shape(
 
     import zarr
 
+    from regiongrow._zarr_compat import zarr_array_keys
+
     try:
         root = zarr.open_group(str(path), mode="r")
         lg = root["labels"][chosen]
@@ -545,7 +554,8 @@ def materialize_saved_labels_at_shape(
     if not level_shapes:
         try:
             keys = sorted(
-                lg.array_keys(), key=lambda k: int(k) if str(k).isdigit() else k
+                zarr_array_keys(lg),
+                key=lambda k: int(k) if str(k).isdigit() else k,
             )
         except _ZARR_IO_ERRORS:
             keys = ["0"]

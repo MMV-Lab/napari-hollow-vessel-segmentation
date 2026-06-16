@@ -1,7 +1,4 @@
-"""Chunk-wise preprocessing from one OME-Zarr store to another (disk streaming).
-
-Requires optional deps in the **same** env: ``pip install -e ".[zarr-cli]"``.
-"""
+"""Chunk-wise preprocessing from one OME-Zarr store to another (disk streaming)."""
 
 from __future__ import annotations
 
@@ -18,8 +15,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         import zarr  # noqa: F401
     except ImportError as exc:
         print(
-            "Missing zarr (and possibly other zarr-cli extras).\n"
-            'Install into this same Python environment:\n  pip install -e ".[zarr-cli]"',
+            "Missing dependency — reinstall: pip install -e .",
             file=sys.stderr,
         )
         print(f"  {sys.executable}\n  {exc!r}", file=sys.stderr)

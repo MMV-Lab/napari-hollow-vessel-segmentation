@@ -28,8 +28,12 @@ from regiongrow._preprocessing_zarr import (  # noqa: WPS433 (internal import ok
     _ensure_multiscales_image_for_reader,
     _get_multiscales_image_dict,
     _multiscales_layout,
-    _output_blosc_compressor,
     _read_multiscales_datasets,
+)
+from regiongrow._zarr_compat import (
+    zarr_array_keys,
+    zarr_create_array,
+    zarr_output_codec_kwargs,
 )
 
 
@@ -267,38 +271,11 @@ def _fill_coarse_labels_from_fine_zarr(fine: zarr.Array, coarse: zarr.Array) -> 
         coarse[zz, yy, xx] = _nn_resize_block(block, out_sz)
 
 
-def _zarr_format_of(arr: zarr.Array) -> int:
-    zfmt = int(getattr(getattr(arr, "metadata", None), "zarr_format", None) or 2)
-    return 2 if zfmt not in (2, 3) else zfmt
-
-
 def _codec_kwargs_for_labels(
     ref_node: zarr.Array, compressor: Optional[Any]
 ) -> Dict[str, Any]:
-    """Return ``compressor`` or ``compressors`` kwargs for ``require_dataset``."""
-    if compressor is not None:
-        if _zarr_format_of(ref_node) == 3:
-            return {"compressors": compressor}
-        return {"compressor": compressor}
-    zfmt = _zarr_format_of(ref_node)
-    if zfmt == 2:
-        try:
-            c = _output_blosc_compressor(ref_node)
-        except (TypeError, AttributeError):
-            c = None
-        if c is not None:
-            return {"compressor": c}
-        return {}
-    try:
-        from zarr.codecs import BloscCodec, BloscShuffle
-
-        return {
-            "compressors": [
-                BloscCodec(cname="zstd", clevel=3, shuffle=BloscShuffle.bitshuffle)
-            ]
-        }
-    except ImportError:
-        return {}
+    """Return ``compressor`` or ``compressors`` kwargs for label array creation."""
+    return zarr_output_codec_kwargs(ref_node, compressor=compressor)
 
 
 def _ct_from_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -309,10 +286,7 @@ def _ct_from_entry(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _label_array_keys(lg: zarr.Group) -> List[str]:
-    try:
-        return [str(k) for k in lg.array_keys()]
-    except AttributeError:
-        return [str(k) for k, v in lg.items() if isinstance(v, zarr.Array)]
+    return zarr_array_keys(lg)
 
 
 def _remove_stale_label_arrays(
@@ -344,7 +318,8 @@ def _create_labels_dataset(
     """Create or replace a uint8 labels array (``require_dataset`` keeps wrong shapes)."""
     if name in lg:
         del lg[name]
-    return lg.create_dataset(
+    return zarr_create_array(
+        lg,
         name,
         shape=shape,
         dtype=np.uint8,
