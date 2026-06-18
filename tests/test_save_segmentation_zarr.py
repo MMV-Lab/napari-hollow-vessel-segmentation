@@ -110,9 +110,9 @@ def test_upsample_labels_nearest() -> None:
     assert int(out.sum()) >= 1
 
 
-def test_omezarr_reader_loads_latest_segmentation() -> None:
+def test_omezarr_reader_opens_image_only() -> None:
     from regiongrow._save_segmentation_zarr import write_segmentation_labels_to_ome_zarr
-    from regiongrow._omezarr_reader import read_omezarr_with_segmentation
+    from regiongrow._omezarr_reader import read_omezarr_image, read_omezarr_with_segmentation
 
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -122,17 +122,11 @@ def test_omezarr_reader_loads_latest_segmentation() -> None:
         seg = np.zeros((8, 10, 12), dtype=np.uint8)
         seg[1:4, 2:5, 3:8] = 1
         write_segmentation_labels_to_ome_zarr(store, seg, build_pyramid=True)
-        write_segmentation_labels_to_ome_zarr(store, seg, build_pyramid=True)
 
-        layers = read_omezarr_with_segmentation(store)
-        kinds = [k for _d, _m, k in layers]
-        assert "image" in kinds
-        assert "labels" in kinds
-        # Should pick latest name (segmentation_v2)
-        lbl = [m for _d, m, k in layers if k == "labels"][0]
-        assert "segmentation_v2" in str(lbl.get("name", ""))
-        ld = [d for d, m, k in layers if k == "labels"][0]
-        assert isinstance(ld, list) and len(ld) >= 1
+        for reader in (read_omezarr_image, read_omezarr_with_segmentation):
+            layers = reader(store)
+            kinds = [k for _d, _m, k in layers]
+            assert kinds == ["image"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

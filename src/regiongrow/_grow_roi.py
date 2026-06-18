@@ -29,8 +29,8 @@ def grow_roi_slices_zyx(
     tube_radius_vox: float,
     margin_voxels: float = 0.0,
     *,
-    pad_z_tube_factor: float = 2.0,
-    pad_xy_tube_factor: float = 1.5,
+    pad_z_tube_factor: float = 3.0,
+    pad_xy_tube_factor: float = 3.0,
     edge_sigma_phys: float = 0.0,
 ) -> SliceTriple:
     """Bounding box around the branch polyline with generous physical padding.

@@ -31,32 +31,39 @@ def spatial_alignment_kwargs(ref_layer: Any) -> Dict[str, Any]:
 def spatial_alignment_for_pyramid_level(ref_layer: Any, level: int) -> Dict[str, Any]:
     """Spatial kwargs for a layer whose ``data.shape`` matches pyramid *level*.
 
-    Napari multiscale Images keep ``scale`` in **finest-voxel** physical units.
-    A labels array at a coarser level has one voxel per ``downsample_factors[level]``
-    finest voxels along each axis, so each coarse voxel must be drawn ``factor``
-    times larger in world space — multiply ``scale`` accordingly. ``translate`` /
-    ``rotate`` / ``shear`` stay unchanged (shared origin).
+    ``scale`` is set from :func:`regiongrow._volume_utils.voxel_spacing_zyx_for_level`
+    so anisotropic NGFF metadata is honoured even when ``ref_layer.scale`` is still
+    ``(1, 1, 1)``. ``translate`` / ``rotate`` / ``shear`` are copied from the image.
     """
+    from regiongrow._volume_utils import (
+        image_level_shape,
+        voxel_spacing_zyx_for_level,
+        voxel_spacing_zyx_finest,
+    )
+
     kwargs = spatial_alignment_kwargs(ref_layer)
-    if not getattr(ref_layer, "multiscale", False):
-        return kwargs
-    if "scale" not in kwargs:
-        return kwargs
-    try:
-        factors = np.asarray(
-            ref_layer.downsample_factors[int(level)], dtype=np.float64
-        )
-    except (AttributeError, IndexError, TypeError, ValueError):
-        return kwargs
-    orig = np.asarray(kwargs["scale"], dtype=np.float64)
-    flat = orig.ravel()
-    fac = factors.ravel()
-    if fac.size < flat.size:
-        fac = np.pad(fac, (flat.size - fac.size, 0), constant_values=1.0)
-    elif fac.size > flat.size:
-        fac = fac[-flat.size :]
-    fac[fac <= 0] = 1.0
-    kwargs["scale"] = (flat * fac).reshape(orig.shape)
+    orig = np.asarray(
+        kwargs.get("scale", getattr(ref_layer, "scale", (1.0, 1.0, 1.0))),
+        dtype=np.float64,
+    )
+    if getattr(ref_layer, "multiscale", False):
+        try:
+            shp = tuple(int(x) for x in image_level_shape(ref_layer, int(level)))
+        except (TypeError, ValueError, IndexError):
+            shp = ()
+        if len(shp) >= 3:
+            sz, sy, sx = voxel_spacing_zyx_for_level(
+                ref_layer, int(level), shp[-3:]
+            )
+        else:
+            sz, sy, sx = voxel_spacing_zyx_finest(ref_layer)
+    else:
+        sz, sy, sx = voxel_spacing_zyx_finest(ref_layer)
+    flat = orig.ravel().copy()
+    if flat.size < 3:
+        flat = np.pad(flat, (3 - flat.size, 0), constant_values=1.0)
+    flat[-3:] = (sz, sy, sx)
+    kwargs["scale"] = flat.reshape(orig.shape) if orig.ndim > 0 else flat
     return kwargs
 
 

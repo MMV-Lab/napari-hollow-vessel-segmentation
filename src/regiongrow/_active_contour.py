@@ -271,7 +271,7 @@ def active_contour_grow(
     radius=10.0,
     spacing=None,
     # ── edge image ──
-    sigma=10.0,
+    sigma=3.0,
     edge_alpha: float = 100.0,
     # ── intensity flattening (optional) ──
     low_intensity_equalize_below: float = 0.0,

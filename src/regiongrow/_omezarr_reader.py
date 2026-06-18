@@ -1,8 +1,8 @@
-"""OME-Zarr reader that also loads saved segmentations.
+"""OME-Zarr reader for napari (image pyramid only).
 
-Napari's built-in OME-Zarr reader may load only the image by default. This reader
-returns the image plus the *latest* segmentation stored under ``labels/`` (if present),
-so users can continue editing and re-saving.
+Saved segmentations under ``labels/`` are **not** opened automatically — use the
+plugin's **Load saved segmentation from OME-Zarr…** button to import a mask into
+the empty ``Segmentation`` layer on the current pyramid grid.
 """
 
 from __future__ import annotations
@@ -631,8 +631,8 @@ def load_latest_saved_labels_layerdata(store: str | Path) -> Optional[LayerDataT
     return load_saved_labels_layerdata(store)
 
 
-def read_omezarr_with_segmentation(path: str | Path) -> List[LayerDataTuple]:
-    """Return image layers and latest segmentation labels (if present)."""
+def read_omezarr_image(path: str | Path) -> List[LayerDataTuple]:
+    """Return only the main image pyramid from an OME-Zarr store."""
     path = resolve_omezarr_store_root(Path(path))
     from ome_zarr.io import ZarrLocation
     from ome_zarr.reader import Reader
@@ -647,27 +647,20 @@ def read_omezarr_with_segmentation(path: str | Path) -> List[LayerDataTuple]:
         idata, imeta = _napari_sort_multiscale_list(
             list(image_node.data), dict(image_node.metadata or {})
         )
-        out.append((idata, {"name": name, "metadata": imeta}, "image"))
+        layer_kw: Dict[str, Any] = {"name": name, "metadata": imeta}
+        from regiongrow._volume_utils import ngff_finest_voxel_spacing_zyx
 
-    label_names = _ngff_label_names_from_store(path)
-    if not label_names:
-        root_attrs = loc.root_attrs
-        raw = root_attrs.get("labels", [])
-        label_names = [str(x) for x in raw] if isinstance(raw, list) else []
-    chosen = _pick_saved_segmentation_label(label_names, path)
-    if chosen:
-        # labels node paths are "labels/<chosen>"
-        lab_loc = loc.create(f"labels/{chosen}")
-        lab_nodes = list(Reader(lab_loc)())
-        ln = _pick_label_pyramid_node(lab_nodes, chosen)
-        if ln is not None:
-            lname = f"{chosen}"
-            ldata, lmeta = _napari_sort_multiscale_list(
-                list(ln.data), dict(ln.metadata or {})
-            )
-            out.append((ldata, {"name": lname, "metadata": lmeta}, "labels"))
+        finest_scale = ngff_finest_voxel_spacing_zyx(imeta)
+        if finest_scale is not None:
+            layer_kw["scale"] = finest_scale
+        out.append((idata, layer_kw, "image"))
 
     return out
+
+
+def read_omezarr_with_segmentation(path: str | Path) -> List[LayerDataTuple]:
+    """Backward-compatible alias — returns the image only (no ``labels`` layers)."""
+    return read_omezarr_image(path)
 
 
 def napari_get_reader(path: Any) -> Optional[Callable[[str], List[LayerDataTuple]]]:
@@ -687,7 +680,7 @@ def napari_get_reader(path: Any) -> Optional[Callable[[str], List[LayerDataTuple
         return None
 
     def _reader(_path: str) -> List[LayerDataTuple]:
-        return read_omezarr_with_segmentation(_path)
+        return read_omezarr_image(_path)
 
     return _reader
 

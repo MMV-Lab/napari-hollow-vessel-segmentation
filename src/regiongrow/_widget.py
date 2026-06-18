@@ -54,6 +54,7 @@ from ._volume_utils import (
     check_materialization_budget,
     clear_image_level_cache,
     invalidate_image_level_cache,
+    default_pyramid_level_index,
     image_finest_shape,
     image_level_data,
     image_level_is_lazy,
@@ -92,17 +93,22 @@ _MAX_GIF_CAPTURE_BYTES = 1.5e9
 _MAX_3D_DISPLAY_GB = 3.0
 _MAX_3D_DISPLAY_BYTES = _MAX_3D_DISPLAY_GB * 1e9
 
+_SAVE_TARGET_NEW = 0
+_SAVE_TARGET_AUTOSAVE = 1
+_SAVE_TARGET_OVERWRITE_LOADED = 2
+_SAVE_TARGET_CHOOSE_FOLDER = 3
+
 # Three-layer workflow for vessel branches.
 MERGED_SEG_LAYER_NAME = "Merged_Segmentation"
 DRAFT_BRANCH_LAYER_NAME = "Draft_Branch"
 BLOCKER_MASK_LAYER_NAME = "Blocker_Mask"
 THRESHOLD_MASK_LAYER_NAME = "Threshold_Mask"
 
-# Napari color names offered for vessel segmentation overlays (label value 1).
-SEGMENTATION_COLOR_CHOICES: tuple[str, ...] = (
+# Napari color names for segmentation overlays and branch point markers.
+LAYER_COLOR_CHOICES: tuple[str, ...] = (
+    "magenta",
     "cyan",
     "lime",
-    "magenta",
     "yellow",
     "orange",
     "deepskyblue",
@@ -112,6 +118,15 @@ SEGMENTATION_COLOR_CHOICES: tuple[str, ...] = (
     "white",
 )
 
+BRANCH_LAYER_COLOR_CHOICES: tuple[str, ...] = tuple(
+    c for c in LAYER_COLOR_CHOICES if c != "magenta"
+)
+
+DEFAULT_SEGMENTATION_COLOR = "magenta"
+DEFAULT_BRANCH_POINTS_COLOR = "cyan"
+
+BRANCH_POINTS_COLOR_CYCLE: tuple[str, ...] = BRANCH_LAYER_COLOR_CHOICES
+
 
 def _binary_segmentation_colormap(foreground_color: str) -> DirectLabelColormap:
     """Colormap for binary vessel masks (background 0, foreground label 1)."""
@@ -120,7 +135,33 @@ def _binary_segmentation_colormap(foreground_color: str) -> DirectLabelColormap:
             0: "transparent",
             1: str(foreground_color),
             None: "transparent",
-        }
+        },
+        use_selection=True,
+        selection=1,
+    )
+
+
+def _ensure_labels_show_selected(lyr: Any, *, label: int = 1) -> None:
+    """Keep napari's "show selected" enabled for plugin-managed binary mask layers."""
+    if not isinstance(lyr, napari.layers.Labels):
+        return
+    try:
+        lyr.selected_label = int(label)
+        lyr.show_selected_label = True
+    except Exception:
+        pass
+
+
+def _skeletal_preview_colormap() -> DirectLabelColormap:
+    """Only label 1 is drawn; background 0 stays invisible in 3-D volume mode."""
+    return DirectLabelColormap(
+        color_dict={
+            0: "transparent",
+            1: "#00cc33",
+            None: "transparent",
+        },
+        use_selection=True,
+        selection=1,
     )
 
 
@@ -139,12 +180,12 @@ def _polyline_indices_for_level(
     if poly_fine.size == 0:
         return poly_fine.astype(np.int64)
     sz = tuple(int(x) for x in shape_work)
-    if is_multiscale_image_layer(image_layer):
-        df = np.asarray(
-            image_layer.downsample_factors[int(level)], dtype=np.float64
-        ).ravel()
-    else:
-        df = np.ones(max(poly_fine.shape[1], 3), dtype=np.float64)
+    from regiongrow._volume_utils import _level_downsample_factors
+
+    df = np.asarray(
+        _level_downsample_factors(image_layer, int(level), sz),
+        dtype=np.float64,
+    ).ravel()
     if df.size >= 3:
         df3 = df[-3:].copy()
     else:
@@ -243,7 +284,21 @@ def _is_branch_draft_labels_name(name: str) -> bool:
 
 
 def _is_segmentation_mask_numbered_name(name: str) -> bool:
-    return bool(re.match(r"^Segmentation_\d+$", str(name).strip()))
+    """``Segmentation`` or ``Segmentation_<n>`` (plugin default mask names)."""
+    name = str(name).strip()
+    if name == "Segmentation":
+        return True
+    return bool(re.match(r"^Segmentation_\d+$", name))
+
+
+def _segmentation_mask_name_sort_key(name: str) -> tuple[int, int]:
+    """Order masks: ``Segmentation``, then ``Segmentation_1``, ``Segmentation_2``, …"""
+    if name == "Segmentation":
+        return (0, 0)
+    m = re.match(r"^Segmentation_(\d+)$", str(name).strip())
+    if m:
+        return (1, int(m.group(1)))
+    return (2, 0)
 
 
 def _is_merge_target_labels_name(name: str) -> bool:
@@ -285,7 +340,7 @@ def _preferred_merge_target_layer_name(names: List[str]) -> Optional[str]:
     ordered = [str(n) for n in names if n]
     numbered = sorted(
         (n for n in ordered if _is_segmentation_mask_numbered_name(n)),
-        key=lambda n: int(n.split("_", 1)[1]),
+        key=_segmentation_mask_name_sort_key,
     )
     if numbered:
         return numbered[0]
@@ -515,6 +570,9 @@ class RegionGrowWidget(QWidget):
         self._gif_capture_combine_this_run = False
         self._skeletal_preview_vispy_registered = False
         self._branch_point_size_bases: dict = {}
+        self._layer_display_colors: dict[str, str] = {}
+        self._color_target: str = "segmentation"
+        self._syncing_color_combo = False
         self._branch_point_zoom_ref: Optional[float] = None
         self._forced_3d_display_layer_name: Optional[str] = None
         self._forced_2d_display_layer_name: Optional[str] = None
@@ -527,6 +585,7 @@ class RegionGrowWidget(QWidget):
         self._autosave_worker = None
         self._autosave_pending: Optional[tuple] = None
         self._save_segmentation_worker = None
+        self._loaded_segmentation_source: Optional[Tuple[str, str]] = None
         self._load_segmentation_worker = None
         self._dims_nav_override = False
         self._saved_dims_range: Optional[tuple] = None
@@ -558,6 +617,7 @@ class RegionGrowWidget(QWidget):
         _init_img = self._get_image_layer()
         if _init_img is not None:
             self._ensure_default_segmentation_mask_for_image(_init_img, select=True)
+        self._update_save_target_combo_state()
 
         # Keep combos in sync with layer changes
         self.viewer.layers.events.inserted.connect(self._on_layer_inserted)
@@ -576,20 +636,140 @@ class RegionGrowWidget(QWidget):
         except AttributeError:
             pass
 
-    def _segmentation_label_color(self) -> str:
-        cb = getattr(self, "seg_color_combo", None)
-        if cb is None:
-            return "cyan"
-        name = str(cb.currentText()).strip()
-        return name or "cyan"
+    def _layer_color(self, layer_name: str, default: str) -> str:
+        return str(self._layer_display_colors.get(str(layer_name), default))
 
-    def _segmentation_label_color_hex(self) -> str:
+    def _set_layer_color(self, layer_name: str, color: str) -> None:
+        self._layer_display_colors[str(layer_name)] = str(color).strip()
+
+    def _branch_points_color_for_new_layer(self) -> str:
+        n = sum(
+            1
+            for lyr in self.viewer.layers
+            if _is_auto_sized_branch_points_name(lyr.name)
+        )
+        return BRANCH_POINTS_COLOR_CYCLE[n % len(BRANCH_POINTS_COLOR_CYCLE)]
+
+    def _register_branch_points_layer_color(self, layer_name: str) -> str:
+        color = self._branch_points_color_for_new_layer()
+        self._set_layer_color(layer_name, color)
+        return color
+
+    def _register_segmentation_layer_color(
+        self, layer_name: str, *, color: Optional[str] = None
+    ) -> str:
+        c = color or DEFAULT_SEGMENTATION_COLOR
+        self._set_layer_color(layer_name, c)
+        return c
+
+    def _active_color_target_layer_name(self) -> Optional[str]:
+        if self._color_target == "branch":
+            name = self.branch_combo.currentText().strip()
+        else:
+            name = _combo_layer_name(self.branch_trunk_combo)
+            if not name:
+                name = self.branch_trunk_combo.currentText().strip()
+        if name and name in self.viewer.layers:
+            return name
+        return None
+
+    def _sync_color_combo_from_target(self) -> None:
+        name = self._active_color_target_layer_name()
+        if not name:
+            return
+        default = (
+            DEFAULT_BRANCH_POINTS_COLOR
+            if self._color_target == "branch"
+            else DEFAULT_SEGMENTATION_COLOR
+        )
+        color = self._layer_color(name, default)
+        choices = (
+            LAYER_COLOR_CHOICES
+            if self._color_target == "segmentation"
+            else BRANCH_LAYER_COLOR_CHOICES
+        )
+        if color not in choices:
+            color = default
+        cb = self.seg_color_combo
+        self._syncing_color_combo = True
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItems(list(choices))
+        idx = cb.findText(color)
+        if idx >= 0:
+            cb.setCurrentIndex(idx)
+        cb.blockSignals(False)
+        self._syncing_color_combo = False
+
+    def _on_branch_combo_color_target(self, *_args: Any) -> None:
+        self._color_target = "branch"
+        self._sync_color_combo_from_target()
+
+    def _on_branch_trunk_combo_color_target(self, *_args: Any) -> None:
+        self._color_target = "segmentation"
+        self._sync_color_combo_from_target()
+
+    def _apply_color_to_layer_name(self, layer_name: str, color: str) -> None:
+        if layer_name not in self.viewer.layers:
+            return
+        lyr = self.viewer.layers[layer_name]
+        if isinstance(lyr, napari.layers.Points) and _is_auto_sized_branch_points_name(
+            layer_name
+        ):
+            try:
+                lyr.face_color = color
+                lyr.border_color = "white"
+            except Exception:
+                pass
+            return
+        if isinstance(lyr, napari.layers.Labels) and self._is_segmentation_labels_layer(
+            lyr
+        ):
+            self._apply_stored_labels_color(lyr, color)
+
+    def _apply_stored_labels_color(
+        self, lyr: Any, color: Optional[str] = None
+    ) -> None:
+        if not isinstance(lyr, napari.layers.Labels):
+            return
+        if str(getattr(lyr, "name", "")) == "Skeletal Preview":
+            return
+        c = color or self._layer_color(
+            str(lyr.name), DEFAULT_SEGMENTATION_COLOR
+        )
+        try:
+            lyr.colormap = _binary_segmentation_colormap(c)
+        except Exception:
+            pass
+        nm = str(getattr(lyr, "name", ""))
+        if not _is_branch_draft_labels_name(nm) and not _is_blocker_labels_name(nm):
+            _ensure_labels_show_selected(lyr)
+
+    def _draft_branch_preview_color(self) -> str:
+        bname = self.branch_combo.currentText().strip()
+        if bname and _is_auto_sized_branch_points_name(bname):
+            return self._layer_color(bname, DEFAULT_BRANCH_POINTS_COLOR)
+        return DEFAULT_BRANCH_POINTS_COLOR
+
+    def _segmentation_label_color(self) -> str:
+        name = _combo_layer_name(self.branch_trunk_combo)
+        if not name:
+            name = self.branch_trunk_combo.currentText().strip()
+        if name:
+            return self._layer_color(name, DEFAULT_SEGMENTATION_COLOR)
+        return DEFAULT_SEGMENTATION_COLOR
+
+    def _segmentation_label_color_hex(self, layer_name: Optional[str] = None) -> str:
         """RGB hex string (no ``#``) for OME-Zarr label metadata."""
         from napari.utils.color import ColorArray
 
-        rgba = np.asarray(ColorArray(self._segmentation_label_color())).reshape(-1)
+        if layer_name:
+            color = self._layer_color(layer_name, DEFAULT_SEGMENTATION_COLOR)
+        else:
+            color = self._segmentation_label_color()
+        rgba = np.asarray(ColorArray(color)).reshape(-1)
         if rgba.size < 3:
-            return "00FFFF"
+            return "FF00FF"
         r, g, b = (int(np.clip(round(float(c) * 255), 0, 255)) for c in rgba[:3])
         return f"{r:02X}{g:02X}{b:02X}"
 
@@ -611,31 +791,14 @@ class RegionGrowWidget(QWidget):
             return True
         return False
 
-    def _apply_segmentation_color_to_labels_layer(self, lyr: Any) -> None:
-        if not isinstance(lyr, napari.layers.Labels):
+    def _on_layer_color_changed(self, color: str) -> None:
+        if self._syncing_color_combo:
             return
-        try:
-            lyr.colormap = _binary_segmentation_colormap(
-                self._segmentation_label_color()
-            )
-        except Exception:
-            pass
-
-    def _apply_segmentation_color_to_all_layers(self) -> None:
-        seen: set[str] = set()
-        for lyr in self.viewer.layers:
-            if self._is_segmentation_labels_layer(lyr):
-                self._apply_segmentation_color_to_labels_layer(lyr)
-                seen.add(str(lyr.name))
-        for lyr in (
-            self._branch_trunk_labels_layer(),
-            self._current_segmentation_target_layer(),
-        ):
-            if lyr is not None and str(lyr.name) not in seen:
-                self._apply_segmentation_color_to_labels_layer(lyr)
-
-    def _on_segmentation_color_changed(self, *_args: Any) -> None:
-        self._apply_segmentation_color_to_all_layers()
+        name = self._active_color_target_layer_name()
+        if not name:
+            return
+        self._set_layer_color(name, color)
+        self._apply_color_to_layer_name(name, color)
 
     def _forced_3d_layer_name(self, image_layer_name: str) -> str:
         return f"{image_layer_name} (3D view)"
@@ -1191,7 +1354,7 @@ class RegionGrowWidget(QWidget):
         self.grow_use_roi_check.setChecked(True)
         self.grow_use_roi_check.setToolTip(
             "When enabled, only a bounding box around the branch polyline is loaded and "
-            "processed (padding ≈ 2× tube radius in Z, 1.5× in XY). Disable to run on the "
+            "processed (padding ≈ 3× tube radius in Z and XY). Disable to run on the "
             "full pyramid level (slower; may hit the RAM limit on large volumes)."
         )
         layer_form.addRow(_row(self.grow_use_roi_check))
@@ -1210,8 +1373,8 @@ class RegionGrowWidget(QWidget):
             "Load saved segmentation from OME-Zarr…"
         )
         self.btn_load_saved_segmentation.setToolTip(
-            "Add a saved NGFF labels group from an .ome.zarr store as Segmentation_N "
-            "on the current Image and pyramid level.\n"
+            "Load a saved NGFF labels group into the Segmentation layer on the "
+            "current Image and pyramid level (replaces the empty default mask).\n"
             "Select the .ome.zarr root or labels/ to choose a group; select "
             "labels/<name>/ to load that group directly."
         )
@@ -1250,14 +1413,15 @@ class RegionGrowWidget(QWidget):
         vis_form.addRow(anim_cap_row)
 
         self.seg_color_combo = QComboBox()
-        self.seg_color_combo.addItems(list(SEGMENTATION_COLOR_CHOICES))
-        self.seg_color_combo.setCurrentText("cyan")
+        self.seg_color_combo.addItems(list(LAYER_COLOR_CHOICES))
+        self.seg_color_combo.setCurrentText(DEFAULT_SEGMENTATION_COLOR)
         self.seg_color_combo.setToolTip(
-            "Color for vessel segmentation overlays (Draft Branch, merged mask, "
-            "Segmentation Result layers). Does not affect blockers.\n"
-            "Try cyan, lime, or yellow on grayscale / inverted colormaps where red is hard to see."
+            "Color for the layer selected in Branch points layer or Segmentation mask. "
+            f"Magenta is reserved for segmentation; branch points and Draft_Branch use "
+            f"cyan → lime → yellow → … New segmentation layers default to "
+            f"{DEFAULT_SEGMENTATION_COLOR}."
         )
-        vis_form.addRow("Segmentation color:", _row(self.seg_color_combo))
+        vis_form.addRow("Layer color:", _row(self.seg_color_combo))
 
         self.capture_options = QWidget()
         cap_form = QFormLayout(self.capture_options)
@@ -1366,8 +1530,8 @@ class RegionGrowWidget(QWidget):
         self.branch_trunk_combo.setToolTip(
             "Labels layer that receives Merge and supplies the existing mask during Grow "
             "(union with the growing region). Same shape as Image. "
-            "Draft_Branch is never listed here. Selecting an image creates Segmentation_1 "
-            "automatically when no mask exists on this grid."
+            "Draft_Branch is never listed here. Selecting an image creates Segmentation "
+            "when no mask exists yet. Use New Mask for additional masks on this grid."
         )
         mask_row_widget = QWidget()
         mask_row = QHBoxLayout(mask_row_widget)
@@ -1375,7 +1539,8 @@ class RegionGrowWidget(QWidget):
         mask_row.addWidget(self.branch_trunk_combo, 1)
         self.btn_new_segmentation_mask = QPushButton("New Mask")
         self.btn_new_segmentation_mask.setToolTip(
-            "Add a new empty Segmentation_N layer on the current image grid and select it here."
+            "Add a new empty Segmentation / Segmentation_N layer on the current image "
+            "grid and select it here."
         )
         mask_row.addWidget(self.btn_new_segmentation_mask)
         seg_form.addRow("Segmentation mask:", mask_row_widget)
@@ -1387,8 +1552,8 @@ class RegionGrowWidget(QWidget):
         )
         self.btn_new_branch_points_layer = QPushButton("New BranchPoints Layer")
         self.btn_new_branch_points_layer.setToolTip(
-            "Adds a new points layer (e.g. BranchPoints_2) and selects it; "
-            "existing branch point layers are kept."
+            "Adds a new points layer (BranchPoints, then BranchPoints_1, …) and "
+            "selects it; existing branch point layers are kept."
         )
         pts_btn_row.addWidget(self.btn_new_branch_points_layer)
         pts_btn_row.addWidget(self.btn_reset_branch_points_layer)
@@ -1565,7 +1730,7 @@ class RegionGrowWidget(QWidget):
 
         self.branch_ac_sigma_spin = QDoubleSpinBox()
         self.branch_ac_sigma_spin.setRange(0.1, 20.0)
-        self.branch_ac_sigma_spin.setValue(10.0)
+        self.branch_ac_sigma_spin.setValue(3.0)
         self.branch_ac_sigma_spin.setSingleStep(0.5)
         self.branch_ac_sigma_spin.setToolTip(
             "Gaussian σ for the inverse-gradient edge image (branch MGAC only)."
@@ -1776,26 +1941,26 @@ class RegionGrowWidget(QWidget):
             [
                 "New version (segmentation_vN)",
                 "Overwrite autosave (segmentation_autosave)",
-                "Overwrite existing version…",
+                "Overwrite loaded segmentation",
+                "Choose folder…",
             ]
         )
-        self.save_target_combo.setCurrentIndex(0)
+        self.save_target_combo.setCurrentIndex(_SAVE_TARGET_NEW)
         self.save_target_combo.setToolTip(
-            "Where to write under labels/ in the .ome.zarr store:\n"
-            "  - New version: always creates segmentation, segmentation_v2, …\n"
-            "  - Overwrite autosave: replaces labels/segmentation_autosave only\n"
-            "  - Overwrite existing: pick a label group to replace in place\n"
-            "In the folder dialog you can select the .ome.zarr root, labels/, or "
-            "labels/<name>/ — the latter skips the second group picker."
+            "Where to write under labels/ in the image's .ome.zarr store:\n"
+            "  - New version: next segmentation_vN in the loaded image store\n"
+            "  - Overwrite autosave: replaces labels/segmentation_autosave in that store\n"
+            "  - Overwrite loaded: replaces the labels group from Load saved segmentation…\n"
+            "  - Choose folder…: pick another .ome.zarr root or labels/<name>/ to write into"
         )
         save_form.addRow("Save target:", _row(self.save_target_combo))
 
-        self.btn_save_segmentation = QPushButton("Save segmentation to OME-Zarr…")
+        self.btn_save_segmentation = QPushButton("Save segmentation")
         self.btn_save_segmentation.setToolTip(
-            "Write the selected segmentation mask into the image's .ome.zarr store.\n"
-            "Pick the store root (mydata.ome.zarr), not labels/segmentation_v2.\n"
-            "Target and resolution are chosen above. Merge autosave still updates\n"
-            "labels/segmentation_autosave in the background."
+            "Write the selected segmentation mask into an OME-Zarr labels group.\n"
+            "New version, autosave, and overwrite-loaded use the store from the "
+            "selected image (no folder dialog). Choose folder… opens a path picker.\n"
+            "Merge still autosaves to labels/segmentation_autosave in the background."
         )
         save_form.addRow(_row(self.btn_save_segmentation))
 
@@ -1904,6 +2069,9 @@ class RegionGrowWidget(QWidget):
         self.btn_upsample_to_finer.clicked.connect(self._upsample_segmentation_to_finer_level)
         self.btn_apply_morph.clicked.connect(self._apply_morphological_operation)
         self.btn_save_segmentation.clicked.connect(self._save_segmentation_to_omezarr)
+        self.save_target_combo.currentIndexChanged.connect(
+            self._update_save_target_combo_state
+        )
         self.btn_load_saved_segmentation.clicked.connect(
             self._load_saved_segmentation_from_omezarr
         )
@@ -1921,8 +2089,10 @@ class RegionGrowWidget(QWidget):
         self.ms_adapt_slice_step_check.toggled.connect(
             self._apply_pyramid_dims_navigation
         )
-        self.seg_color_combo.currentTextChanged.connect(
-            self._on_segmentation_color_changed
+        self.seg_color_combo.currentTextChanged.connect(self._on_layer_color_changed)
+        self.branch_combo.currentIndexChanged.connect(self._on_branch_combo_color_target)
+        self.branch_trunk_combo.currentIndexChanged.connect(
+            self._on_branch_trunk_combo_color_target
         )
         self.capture_growth_check.toggled.connect(self._on_capture_growth_toggled)
         self.capture_combine_grows_check.toggled.connect(
@@ -1953,9 +2123,6 @@ class RegionGrowWidget(QWidget):
                 )
         self._last_pyramid_level = new_level
         self._refresh_branch_trunk_combo()
-        img = self._get_image_layer()
-        if img is not None:
-            self._ensure_default_segmentation_mask_for_image(img, select=True)
         self._update_pyramid_display_layers()
         self._apply_pyramid_dims_navigation()
         self._apply_dock_layout_constraints()
@@ -2030,14 +2197,17 @@ class RegionGrowWidget(QWidget):
         try:
             existing = dict(getattr(lyr, "color", {}) or {})
             if 1 not in existing:
-                self._apply_segmentation_color_to_labels_layer(lyr)
+                self._apply_stored_labels_color(lyr)
         except Exception:
             pass
         k = 1
         base = DRAFT_BRANCH_LAYER_NAME
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
-        lyr.name = f"{base} ({k})"
+        archived_name = f"{base} ({k})"
+        archived_color = self._layer_color(name, self._draft_branch_preview_color())
+        lyr.name = archived_name
+        self._set_layer_color(archived_name, archived_color)
         self._refresh_draft_branch_combo()
 
     def _sync_layers_after_pyramid_working_level_change(self) -> None:
@@ -2081,9 +2251,22 @@ class RegionGrowWidget(QWidget):
             self._ensure_skeletal_preview_layer(img, shp, level)
             self._clear_skeletal_preview_data(shp)
 
+        seg_msg = ""
+        primary = self._primary_segmentation_mask_layer()
+        if primary is not None:
+            if self._resample_segmentation_mask_to_working_pyramid_level(
+                primary, img, level=level, target_shape=tuple(shp)
+            ):
+                self._prune_orphan_segmentation_masks(primary.name, tuple(shp))
+                self._refresh_branch_trunk_combo()
+                _select_combo_layer(self.branch_trunk_combo, primary.name)
+                seg_msg = " Segmentation resampled to this level."
+            else:
+                seg_msg = " Could not resample segmentation — pick or create a mask."
+
         self.status_label.setText(
-            "Pyramid level changed — branch points kept; draft preview reset. "
-            "Pick a segmentation mask on this grid."
+            "Pyramid level changed — branch points kept; draft preview reset."
+            + seg_msg
         )
         self._apply_dock_layout_constraints()
 
@@ -2127,7 +2310,7 @@ class RegionGrowWidget(QWidget):
             self.ms_level_combo.setItemData(
                 i, multiscale_level_tooltip(lyr, i), Qt.ToolTipRole
             )
-        idx = prev if 0 <= prev < n else 0
+        idx = prev if 0 <= prev < n else default_pyramid_level_index(n)
         self.ms_level_combo.setCurrentIndex(idx)
         self.ms_level_combo.blockSignals(False)
         self.ms_level_combo.setVisible(True)
@@ -2305,6 +2488,7 @@ class RegionGrowWidget(QWidget):
         self._update_postprocess_button()
         self._sync_branch_point_bases_from_image()
         self._update_pyramid_display_layers()
+        self._update_save_target_combo_state()
         img = self._get_image_layer()
         if img is not None:
             self._ensure_default_segmentation_mask_for_image(img, select=True)
@@ -2346,6 +2530,9 @@ class RegionGrowWidget(QWidget):
         for k in list(self._branch_point_size_bases.keys()):
             if k not in alive:
                 del self._branch_point_size_bases[k]
+        for k in list(self._layer_display_colors.keys()):
+            if k not in alive:
+                del self._layer_display_colors[k]
         self._refresh_branch_trunk_combo()
         self._refresh_draft_branch_combo()
         self._sync_branch_point_bases_from_image()
@@ -2504,10 +2691,11 @@ class RegionGrowWidget(QWidget):
         upsampled = ndimage_zoom(mask.astype(np.float64), zoom, order=0) > 0.5
 
         result_name = "Segmentation Result (Original Size)"
+        self._register_segmentation_layer_color(result_name)
         if result_name in self.viewer.layers:
             lyr = self.viewer.layers[result_name]
             lyr.data = upsampled.astype(np.int32)
-            self._apply_segmentation_color_to_labels_layer(lyr)
+            self._apply_stored_labels_color(lyr)
         else:
             orig_layer = self.viewer.layers[orig_name]
             lyr = self.viewer.add_labels(
@@ -2516,7 +2704,7 @@ class RegionGrowWidget(QWidget):
                 opacity=0.5,
                 **spatial_alignment_kwargs(orig_layer),
             )
-            self._apply_segmentation_color_to_labels_layer(lyr)
+            self._apply_stored_labels_color(lyr)
         self._result_layer = res_layer
         self.status_label.setText("Postprocessing complete: upsampled result created.")
 
@@ -2554,14 +2742,14 @@ class RegionGrowWidget(QWidget):
         while nm in self.viewer.layers:
             nm = f"{nm_base} {k}"
             k += 1
+        seg_color = self._register_segmentation_layer_color(nm)
         self.viewer.add_labels(
             up,
             name=nm,
             opacity=0.5,
+            colormap=_binary_segmentation_colormap(seg_color),
             **spatial_alignment_for_pyramid_level(image_layer, target_level),
         )
-        if nm in self.viewer.layers:
-            self._apply_segmentation_color_to_labels_layer(self.viewer.layers[nm])
         # Switch working level to the new finer grid and select it as merge target.
         try:
             self.ms_level_combo.setCurrentIndex(int(target_level))
@@ -2569,6 +2757,7 @@ class RegionGrowWidget(QWidget):
             pass
         self._refresh_branch_trunk_combo()
         _select_combo_layer(self.branch_trunk_combo, nm)
+        self._on_branch_trunk_combo_color_target()
         self.status_label.setText(f'Created refined editable layer "{nm}" on pyramid level {target_level}.')
 
     def _save_resolution_mode(self) -> str:
@@ -2578,13 +2767,127 @@ class RegionGrowWidget(QWidget):
         return "working"
 
     def _save_target_mode(self) -> str:
-        """Return ``new``, ``autosave``, or ``overwrite`` from the post-processing combo."""
+        """Return ``new``, ``autosave``, ``overwrite_loaded``, or ``choose_folder``."""
         idx = int(self.save_target_combo.currentIndex())
-        if idx == 1:
+        if idx == _SAVE_TARGET_AUTOSAVE:
             return "autosave"
-        if idx == 2:
-            return "overwrite"
+        if idx == _SAVE_TARGET_OVERWRITE_LOADED:
+            return "overwrite_loaded"
+        if idx == _SAVE_TARGET_CHOOSE_FOLDER:
+            return "choose_folder"
         return "new"
+
+    def _loaded_segmentation_for_current_image(self) -> Optional[Tuple[str, str]]:
+        """``(store_path, label_group)`` when load matches the selected image store."""
+        src = self._loaded_segmentation_source
+        if src is None:
+            return None
+        image_layer = self._get_image_layer()
+        if image_layer is None:
+            return None
+        inferred = self._infer_omezarr_store_path(image_layer)
+        if inferred is None:
+            return None
+        store_s, label_name = src
+        try:
+            if Path(store_s).resolve() != Path(inferred).resolve():
+                return None
+        except OSError:
+            if str(store_s) != str(inferred):
+                return None
+        return (str(Path(store_s).resolve()), str(label_name))
+
+    def _update_save_target_combo_state(self, *_args: Any) -> None:
+        """Disable overwrite-loaded when no matching segmentation was loaded."""
+        cb = self.save_target_combo
+        loaded = self._loaded_segmentation_for_current_image()
+        model = cb.model()
+        overwrite_item = model.item(_SAVE_TARGET_OVERWRITE_LOADED)
+        if overwrite_item is not None:
+            overwrite_item.setEnabled(loaded is not None)
+            if loaded is None:
+                overwrite_item.setToolTip(
+                    "Load a saved segmentation for this image first "
+                    "(Layers → Load saved segmentation…)."
+                )
+            else:
+                _store, label = loaded
+                overwrite_item.setToolTip(
+                    f"Overwrite labels/{label} in the loaded image store."
+                )
+        if loaded is None and cb.currentIndex() == _SAVE_TARGET_OVERWRITE_LOADED:
+            cb.blockSignals(True)
+            cb.setCurrentIndex(_SAVE_TARGET_NEW)
+            cb.blockSignals(False)
+        choose_folder = cb.currentIndex() == _SAVE_TARGET_CHOOSE_FOLDER
+        self.btn_save_segmentation.setText(
+            "Save segmentation to OME-Zarr…"
+            if choose_folder
+            else "Save segmentation"
+        )
+
+    def _resolve_save_destination(
+        self, image_layer: Any, save_mode: str
+    ) -> Optional[Tuple[str, Optional[str], bool]]:
+        """Return ``(store_path, labels_name, use_checkpoint)`` or None if cancelled."""
+        from ._omezarr_reader import resolve_label_load_target
+
+        if save_mode == "choose_folder":
+            inferred = self._infer_omezarr_store_path(image_layer)
+            start_dir = str(inferred) if inferred is not None else str(Path.cwd())
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Select .ome.zarr store or labels/<name>/ to save into",
+                start_dir,
+            )
+            if not path:
+                self.status_label.setText("Save cancelled.")
+                return None
+            store_path_obj, label_from_path = resolve_label_load_target(Path(path))
+            store_path = str(store_path_obj)
+            if label_from_path and "__tmp_" in str(label_from_path):
+                QMessageBox.warning(
+                    self,
+                    "Invalid save target",
+                    "That path is a temporary staging folder from a failed save.\n"
+                    "Select the .ome.zarr root or labels/<name>/ instead.",
+                )
+                self.status_label.setText(
+                    "Save cancelled — pick a label group, not __tmp_."
+                )
+                return None
+            if label_from_path:
+                return store_path, str(label_from_path), False
+            return store_path, None, False
+
+        inferred = self._infer_omezarr_store_path(image_layer)
+        if inferred is None:
+            QMessageBox.warning(
+                self,
+                "OME-Zarr store unknown",
+                "Could not infer the .ome.zarr store for the selected image.\n\n"
+                "Open the image from its .ome.zarr folder, or use "
+                "'Choose folder…' under Save target.",
+            )
+            self.status_label.setText(
+                "Save cancelled — image store path unknown. Use Choose folder…"
+            )
+            return None
+        store_path = str(inferred)
+
+        if save_mode == "autosave":
+            return store_path, None, True
+        if save_mode == "overwrite_loaded":
+            loaded = self._loaded_segmentation_for_current_image()
+            if loaded is None:
+                self.status_label.setText(
+                    "No loaded segmentation to overwrite — load one first or pick "
+                    "another save target."
+                )
+                return None
+            _store, label_name = loaded
+            return _store, label_name, False
+        return store_path, None, False
 
     def _pick_label_group_dialog(
         self,
@@ -2679,49 +2982,11 @@ class RegionGrowWidget(QWidget):
         if msg:
             self.status_label.setText(msg)
             return
-        inferred = self._infer_omezarr_store_path(image_layer)
-        start_dir = str(inferred) if inferred is not None else str(Path.cwd())
-        path = QFileDialog.getExistingDirectory(
-            self,
-            "Select .ome.zarr store or labels/<name>/ to save into",
-            start_dir,
-        )
-        if not path:
-            self.status_label.setText("Save cancelled.")
-            return
-        from ._omezarr_reader import resolve_label_load_target
-
-        store_path_obj, label_from_path = resolve_label_load_target(Path(path))
-        store_path = str(store_path_obj)
         save_mode = self._save_target_mode()
-        labels_name: Optional[str] = None
-        use_checkpoint = False
-        if save_mode == "autosave":
-            use_checkpoint = True
-        elif save_mode == "overwrite":
-            if label_from_path and "__tmp_" in str(label_from_path):
-                QMessageBox.warning(
-                    self,
-                    "Invalid save target",
-                    "That path is a temporary staging folder from a failed save.\n"
-                    "Select the .ome.zarr root or labels/<name>/ instead.",
-                )
-                self.status_label.setText("Save cancelled — pick a label group, not __tmp_.")
-                return
-            if label_from_path:
-                labels_name = str(label_from_path)
-            else:
-                labels_name = self._pick_label_group_dialog(
-                    store_path,
-                    title="Overwrite label group",
-                    prompt=(
-                        "Replace which labels/ group with the current mask?\n"
-                        "(Or cancel and pick labels/<name>/ directly in the folder dialog.)"
-                    ),
-                )
-            if not labels_name:
-                self.status_label.setText("Save cancelled.")
-                return
+        resolved = self._resolve_save_destination(image_layer, save_mode)
+        if resolved is None:
+            return
+        store_path, labels_name, use_checkpoint = resolved
         # Snapshot on the GUI thread: the background worker must not read a live
         # layer the user can keep editing (torn array → corrupt store).
         seg_data = self._snapshot_segmentation_for_save(
@@ -2735,7 +3000,7 @@ class RegionGrowWidget(QWidget):
             )
             self.status_label.setText("Save cancelled — segmentation mask is empty.")
             return
-        label_color = self._segmentation_label_color_hex()
+        label_color = self._segmentation_label_color_hex(seg_layer.name)
         self.btn_save_segmentation.setEnabled(False)
         self.status_label.setText("Saving segmentation (background)…")
 
@@ -2910,23 +3175,24 @@ class RegionGrowWidget(QWidget):
                 )
                 return
 
-            layer_name = self._allocate_segmentation_mask_name()
-            skw = spatial_alignment_for_pyramid_level(image_layer, pyramid_level)
-            lyr = self.viewer.add_labels(
-                np.asarray(data, dtype=np.int32),
-                name=layer_name,
-                opacity=0.5,
-                colormap=_binary_segmentation_colormap(
-                    self._segmentation_label_color()
-                ),
-                **skw,
+            layer_name = "Segmentation"
+            pyramid_level = int(self._selected_pyramid_level())
+            lyr = self._replace_segmentation_layer_with_loaded_mask(
+                image_layer,
+                data,
+                pyramid_level=pyramid_level,
             )
-            self._result_layer = lyr
-            self._refresh_layers()
+            if lyr is None:
+                self.status_label.setText("Could not apply loaded segmentation.")
+                return
+            self._refresh_layers_now()
             _select_combo_layer(self.branch_trunk_combo, layer_name)
+            self._on_branch_trunk_combo_color_target()
+            self._loaded_segmentation_source = (store_s, chosen_name)
+            self._update_save_target_combo_state()
             n_vox = int(np.count_nonzero(data))
             self.status_label.setText(
-                f'Loaded "{source_name}" as {layer_name} '
+                f'Loaded "{source_name}" into {layer_name} '
                 f"({n_vox:,} voxels, pyramid level {pyramid_level})."
             )
 
@@ -2985,7 +3251,7 @@ class RegionGrowWidget(QWidget):
         if result_name in self.viewer.layers:
             lyr = self.viewer.layers[result_name]
             lyr.data = result.astype(np.int32)
-            self._apply_segmentation_color_to_labels_layer(lyr)
+            self._apply_stored_labels_color(lyr)
         else:
             lyr = self.viewer.add_labels(
                 result.astype(np.int32),
@@ -2993,7 +3259,7 @@ class RegionGrowWidget(QWidget):
                 opacity=0.5,
                 **spatial_alignment_kwargs(res_layer),
             )
-            self._apply_segmentation_color_to_labels_layer(lyr)
+            self._apply_stored_labels_color(lyr)
 
         self._result_layer = res_layer
         self.status_label.setText(
@@ -3047,11 +3313,14 @@ class RegionGrowWidget(QWidget):
         )
 
     def _allocate_extra_branch_points_name(self) -> str:
-        n = getattr(self, "_branch_points_extra_id", 2)
-        while f"BranchPoints_{n}" in self.viewer.layers:
-            n += 1
-        self._branch_points_extra_id = n + 1
-        return f"BranchPoints_{n}"
+        names = {lyr.name for lyr in self.viewer.layers}
+        if "BranchPoints" not in names:
+            return "BranchPoints"
+        for i in range(1, 1000):
+            cand = f"BranchPoints_{i}"
+            if cand not in names:
+                return cand
+        return "BranchPoints_extra"
 
     def _create_new_branch_points_layer(self):
         import pandas as pd
@@ -3061,10 +3330,12 @@ class RegionGrowWidget(QWidget):
             self.status_label.setText("Select an image layer first.")
             return
         spatial_kw = spatial_alignment_kwargs(self.viewer.layers[name])
-        bname = self._allocate_extra_branch_points_name()
         img = self.viewer.layers[name]
+        self._ensure_default_segmentation_mask_for_image(img, select=True)
+        bname = self._allocate_extra_branch_points_name()
         base = _suggested_branch_point_base_size(img)
         self._branch_point_size_bases[bname] = base
+        bcolor = self._register_branch_points_layer_color(bname)
         empty_feat = pd.DataFrame()
         pts = self.viewer.add_points(
             np.empty((0, 3)),
@@ -3072,15 +3343,15 @@ class RegionGrowWidget(QWidget):
             name=bname,
             size=base,
             features=empty_feat,
-            face_color="cyan",
+            face_color=bcolor,
             border_color="white",
             **spatial_kw,
         )
         pts.mode = "add"
         self._wire_branch_points_sync(pts)
-        self._ensure_default_segmentation_mask_for_image(img, select=True)
-        self._refresh_layers()
-        self.branch_combo.setCurrentText(bname)
+        self._refresh_layers_now()
+        _select_combo_layer(self.branch_combo, bname)
+        self._on_branch_combo_color_target()
         self.status_label.setText(
             f'Created "{bname}" — add at least two points in order, then Grow.'
         )
@@ -3113,15 +3384,17 @@ class RegionGrowWidget(QWidget):
             _apply_spatial_kwargs_to_layer(lyr, skw)
             try:
                 lyr.opacity = 0.7
-                self._apply_segmentation_color_to_labels_layer(lyr)
+                preview_color = self._draft_branch_preview_color()
+                self._apply_stored_labels_color(lyr, preview_color)
             except Exception:
                 pass
             return lyr
+        preview_color = self._draft_branch_preview_color()
         lyr = self.viewer.add_labels(
             np.zeros(shape, dtype=np.int32),
             name=DRAFT_BRANCH_LAYER_NAME,
             opacity=0.7,
-            colormap=_binary_segmentation_colormap(self._segmentation_label_color()),
+            colormap=_binary_segmentation_colormap(preview_color),
             **skw,
         )
         return lyr
@@ -3191,7 +3464,7 @@ class RegionGrowWidget(QWidget):
         res = np.asarray(tgt.data, dtype=np.int32).copy()
         res[bsel] = np.maximum(res[bsel], np.asarray(br.data, dtype=np.int32)[bsel])
         tgt.data = res
-        self._apply_segmentation_color_to_labels_layer(tgt)
+        self._apply_stored_labels_color(tgt)
         br.data = np.zeros_like(res, dtype=np.int32)
         self._result_layer = tgt
         self._refresh_draft_branch_combo()
@@ -3252,7 +3525,7 @@ class RegionGrowWidget(QWidget):
             )
         else:
             seg_data = materialize_labels_level(seg_layer, 0)
-        label_color = self._segmentation_label_color_hex()
+        label_color = self._segmentation_label_color_hex(seg_layer_name)
 
         @thread_worker
         def _autosave():
@@ -3298,11 +3571,98 @@ class RegionGrowWidget(QWidget):
 
     def _allocate_segmentation_mask_name(self) -> str:
         names = {lyr.name for lyr in self.viewer.layers}
+        if "Segmentation" not in names:
+            return "Segmentation"
         for i in range(1, 1000):
             cand = f"Segmentation_{i}"
             if cand not in names:
                 return cand
         return "Segmentation_extra"
+
+    def _primary_segmentation_mask_layer(self) -> Optional[Any]:
+        """``Segmentation`` / combo selection, else lowest ``Segmentation_<n>``."""
+        name = _combo_layer_name(self.branch_trunk_combo)
+        if name and name in self.viewer.layers:
+            lyr = self.viewer.layers[name]
+            if isinstance(lyr, napari.layers.Labels) and _is_segmentation_mask_numbered_name(
+                name
+            ):
+                return lyr
+        if "Segmentation" in self.viewer.layers:
+            lyr = self.viewer.layers["Segmentation"]
+            if isinstance(lyr, napari.layers.Labels):
+                return lyr
+        numbered = [
+            lyr
+            for lyr in self.viewer.layers
+            if isinstance(lyr, napari.layers.Labels)
+            and _is_segmentation_mask_numbered_name(lyr.name)
+        ]
+        if not numbered:
+            return None
+        numbered.sort(key=lambda lyr: _segmentation_mask_name_sort_key(lyr.name))
+        return numbered[0]
+
+    def _resample_segmentation_mask_to_working_pyramid_level(
+        self,
+        mask_layer: Any,
+        image_layer: Any,
+        *,
+        level: Optional[int] = None,
+        target_shape: Optional[tuple] = None,
+    ) -> bool:
+        """Nearest-neighbour resample a segmentation mask onto the working pyramid grid."""
+        if level is None:
+            level = int(self._selected_pyramid_level())
+        if target_shape is None:
+            try:
+                target_shape = tuple(
+                    int(x) for x in image_level_shape(image_layer, level)
+                )
+            except (TypeError, ValueError, IndexError):
+                return False
+        if len(target_shape) != 3:
+            return False
+        from ._save_segmentation_zarr import upsample_labels_nearest
+
+        src = np.asarray(mask_layer.data)
+        resampled = upsample_labels_nearest(src, target_shape).astype(np.int32)
+        mask_layer.data = resampled
+        _apply_spatial_kwargs_to_layer(
+            mask_layer, spatial_alignment_for_pyramid_level(image_layer, level)
+        )
+        self._apply_stored_labels_color(mask_layer)
+        if self._result_layer is mask_layer or (
+            self._result_layer is None
+            and _is_segmentation_mask_numbered_name(mask_layer.name)
+        ):
+            self._result_layer = mask_layer
+        return True
+
+    def _prune_orphan_segmentation_masks(
+        self, keep_name: str, target_shape: tuple
+    ) -> None:
+        """Drop stale pyramid copies and empty auto-created duplicates."""
+        tgt = tuple(int(x) for x in target_shape)
+        for lyr in list(self.viewer.layers):
+            if not isinstance(lyr, napari.layers.Labels):
+                continue
+            if not _is_segmentation_mask_numbered_name(lyr.name):
+                continue
+            if lyr.name == keep_name:
+                continue
+            shp = layer_data_shape(lyr)
+            if shp != tgt:
+                try:
+                    self.viewer.layers.remove(lyr.name)
+                except Exception:
+                    pass
+                continue
+            if not np.any(np.asarray(lyr.data) > 0):
+                try:
+                    self.viewer.layers.remove(lyr.name)
+                except Exception:
+                    pass
 
     def _add_empty_segmentation_mask_layer(
         self, image_layer: Any, *, name: Optional[str] = None
@@ -3316,14 +3676,66 @@ class RegionGrowWidget(QWidget):
         if len(shp) != 3:
             return None
         nm = name or self._allocate_segmentation_mask_name()
+        seg_color = self._register_segmentation_layer_color(nm)
         lvl = self._selected_pyramid_level()
-        return self.viewer.add_labels(
+        lyr = self.viewer.add_labels(
             np.zeros(shp, dtype=np.int32),
             name=nm,
             opacity=0.5,
-            colormap=_binary_segmentation_colormap(self._segmentation_label_color()),
+            colormap=_binary_segmentation_colormap(seg_color),
             **spatial_alignment_for_pyramid_level(image_layer, lvl),
         )
+        _ensure_labels_show_selected(lyr)
+        return lyr
+
+    def _replace_segmentation_layer_with_loaded_mask(
+        self,
+        image_layer: Any,
+        data: np.ndarray,
+        *,
+        pyramid_level: int,
+    ) -> Optional[Any]:
+        """Replace the default ``Segmentation`` labels layer with loaded mask data."""
+        seg = np.asarray(data, dtype=np.int32)
+        if seg.ndim != 3:
+            return None
+        tgt_shape = tuple(int(x) for x in seg.shape)
+        skw = spatial_alignment_for_pyramid_level(image_layer, int(pyramid_level))
+        layer_name = "Segmentation"
+        self._register_segmentation_layer_color(layer_name)
+
+        existing: Optional[Any] = None
+        if layer_name in self.viewer.layers:
+            lyr = self.viewer.layers[layer_name]
+            if isinstance(lyr, napari.layers.Labels):
+                if layer_data_shape(lyr) == tgt_shape:
+                    existing = lyr
+
+        if existing is not None:
+            existing.data = seg
+            _apply_spatial_kwargs_to_layer(existing, skw)
+            self._apply_stored_labels_color(existing)
+            self._result_layer = existing
+            return existing
+
+        if layer_name in self.viewer.layers:
+            try:
+                self.viewer.layers.remove(layer_name)
+            except Exception:
+                pass
+
+        lyr = self.viewer.add_labels(
+            seg,
+            name=layer_name,
+            opacity=0.5,
+            colormap=_binary_segmentation_colormap(
+                self._layer_color(layer_name, DEFAULT_SEGMENTATION_COLOR)
+            ),
+            **skw,
+        )
+        _ensure_labels_show_selected(lyr)
+        self._result_layer = lyr
+        return lyr
 
     def _has_merge_target_on_grid(self, image_layer: Any, shape: tuple) -> bool:
         shp = tuple(int(x) for x in shape)
@@ -3339,7 +3751,7 @@ class RegionGrowWidget(QWidget):
     def _ensure_default_segmentation_mask_for_image(
         self, image_layer: Any, *, select: bool = True
     ) -> Optional[Any]:
-        """Create ``Segmentation_1`` (or next free index) when the grid has no merge mask."""
+        """Create ``Segmentation`` (or next free ``Segmentation_N``) when the grid has no merge mask."""
         try:
             shp = image_level_shape(
                 image_layer, self._selected_pyramid_level()
@@ -3352,6 +3764,17 @@ class RegionGrowWidget(QWidget):
             if select:
                 self._refresh_branch_trunk_combo()
             return None
+        primary = self._primary_segmentation_mask_layer()
+        if primary is not None and layer_data_shape(primary) != tuple(shp):
+            if self._resample_segmentation_mask_to_working_pyramid_level(
+                primary, image_layer, target_shape=tuple(shp)
+            ):
+                self._prune_orphan_segmentation_masks(primary.name, tuple(shp))
+                if select:
+                    self._refresh_branch_trunk_combo()
+                    _select_combo_layer(self.branch_trunk_combo, primary.name)
+                    self._on_branch_trunk_combo_color_target()
+                return primary
         nm = self._allocate_segmentation_mask_name()
         lyr = self._add_empty_segmentation_mask_layer(image_layer, name=nm)
         if lyr is None:
@@ -3359,6 +3782,7 @@ class RegionGrowWidget(QWidget):
         if select:
             self._refresh_branch_trunk_combo()
             _select_combo_layer(self.branch_trunk_combo, nm)
+            self._on_branch_trunk_combo_color_target()
         return lyr
 
     def _create_new_segmentation_mask_layer(self) -> None:
@@ -3372,6 +3796,7 @@ class RegionGrowWidget(QWidget):
             return
         self._refresh_layers()
         _select_combo_layer(self.branch_trunk_combo, nm)
+        self._on_branch_trunk_combo_color_target()
         self.status_label.setText(f'New empty mask layer "{nm}".')
 
     def _allocate_new_blocker_name(self) -> str:
@@ -3586,24 +4011,9 @@ class RegionGrowWidget(QWidget):
         cb.blockSignals(False)
 
     def _ensure_trunk_when_missing(self) -> Optional[Any]:
-        """Pick a segmentation mask, or create Segmentation_N if none exist on grid."""
+        """Return the selected segmentation mask, or None if none exist on this grid."""
         self._refresh_branch_trunk_combo()
         cb = self.branch_trunk_combo
-        iname = self._selected_image_layer_name()
-        if not iname or iname not in self.viewer.layers:
-            return self._branch_trunk_labels_layer()
-        img = self.viewer.layers[iname]
-        if not isinstance(img, napari.layers.Image):
-            return self._branch_trunk_labels_layer()
-        try:
-            shp = image_level_shape(img, self._selected_pyramid_level())
-        except (TypeError, ValueError, IndexError):
-            return self._branch_trunk_labels_layer()
-        if len(shp) != 3:
-            return self._branch_trunk_labels_layer()
-        if cb.count() == 0:
-            self._ensure_default_segmentation_mask_for_image(img, select=True)
-            self._refresh_branch_trunk_combo()
         if cb.count() == 0:
             return None
         name = cb.currentText()
@@ -3628,14 +4038,17 @@ class RegionGrowWidget(QWidget):
         try:
             existing = dict(getattr(lyr, "color", {}) or {})
             if 1 not in existing:
-                self._apply_segmentation_color_to_labels_layer(lyr)
+                self._apply_stored_labels_color(lyr)
         except Exception:
             pass
         k = 1
         base = DRAFT_BRANCH_LAYER_NAME
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
-        lyr.name = f"{base} ({k})"
+        archived_name = f"{base} ({k})"
+        archived_color = self._layer_color(name, self._draft_branch_preview_color())
+        lyr.name = archived_name
+        self._set_layer_color(archived_name, archived_color)
         self._refresh_draft_branch_combo()
 
     def _finish_branch_grow_preview_if_needed(self) -> None:
@@ -3654,6 +4067,18 @@ class RegionGrowWidget(QWidget):
         lyr.visible = False
         self._skeletal_preview_vispy_registered = True
 
+    def _apply_skeletal_preview_style(self, lyr: Any) -> None:
+        """Keep Skeletal Preview binary: only label 1 visible, not the background."""
+        if not isinstance(lyr, napari.layers.Labels):
+            return
+        try:
+            lyr.colormap = _skeletal_preview_colormap()
+            lyr.opacity = 0.55
+            lyr.rendering = "translucent"
+            _ensure_labels_show_selected(lyr)
+        except Exception:
+            pass
+
     def _ensure_skeletal_preview_layer(
         self, image_layer: Any, shape: tuple, pyramid_level: int
     ) -> None:
@@ -3662,6 +4087,7 @@ class RegionGrowWidget(QWidget):
             pl = self.viewer.layers["Skeletal Preview"]
             pl.data = np.zeros(shape, dtype=np.uint32)
             _apply_spatial_kwargs_to_layer(pl, skw)
+            self._apply_skeletal_preview_style(pl)
             self._register_skeletal_preview_vispy_if_needed(pl)
             pl.visible = False
             self._preview_layer = pl
@@ -3670,15 +4096,11 @@ class RegionGrowWidget(QWidget):
             np.zeros(shape, dtype=np.uint32),
             name="Skeletal Preview",
             opacity=0.55,
-            colormap=DirectLabelColormap(
-                color_dict={
-                    0: "transparent",
-                    1: "#00cc33",
-                    None: "transparent",
-                }
-            ),
+            colormap=_skeletal_preview_colormap(),
+            rendering="translucent",
             **skw,
         )
+        _ensure_labels_show_selected(lbl)
         self._preview_layer = lbl
         self._skeletal_preview_vispy_registered = False
         self._register_skeletal_preview_vispy_if_needed(lbl)
@@ -4255,7 +4677,9 @@ class RegionGrowWidget(QWidget):
         if iteration < 0:
             if "Skeletal Preview" in self.viewer.layers:
                 sp = self.viewer.layers["Skeletal Preview"]
-                sp.data = mask.astype(np.uint32)
+                sp.data = (np.asarray(mask) > 0).astype(np.uint32)
+                self._apply_skeletal_preview_style(sp)
+                sp.visible = True
             self.status_label.setText(
                 f"Branch tube preview — {int(mask.sum()):,} voxels"
             )

@@ -56,3 +56,12 @@ def test_world_bounds_zyx_for_pyramid_level() -> None:
     z_lo, z_hi = world_bounds_zyx_for_pyramid_level(lyr, 1)[0]
     assert z_lo == 0.0
     assert z_hi == 12.0  # (4-1) * 4
+
+
+def test_default_pyramid_level_index_prefers_three_when_available() -> None:
+    from regiongrow._volume_utils import default_pyramid_level_index
+
+    assert default_pyramid_level_index(1) == 0
+    assert default_pyramid_level_index(2) == 1
+    assert default_pyramid_level_index(4) == 3
+    assert default_pyramid_level_index(10) == 3

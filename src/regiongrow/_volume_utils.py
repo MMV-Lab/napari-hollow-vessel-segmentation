@@ -65,6 +65,14 @@ def multiscale_level_count(layer: Any) -> int:
     return 1
 
 
+def default_pyramid_level_index(num_levels: int, preferred: int = 3) -> int:
+    """Default working pyramid index: *preferred* when present, else coarsest."""
+    n = int(num_levels)
+    if n <= 1:
+        return 0
+    return min(int(preferred), n - 1)
+
+
 def _unwrap_data_element(x: Any) -> Any:
     """Return underlying array-like (dask or numpy) for one multiscale level."""
     return x
@@ -274,13 +282,61 @@ def estimate_dense_bytes(shape: Tuple[int, ...], dtype: Any, copies: float = 1.0
 
 
 def voxel_spacing_zyx_finest(layer: Any) -> Tuple[float, float, float]:
-    """Voxel spacing (Z, Y, X) treating ``layer.scale`` as finest-level µm/voxel."""
+    """Voxel spacing (Z, Y, X) at the finest pyramid level in physical units.
+
+    Prefers NGFF ``coordinateTransformations`` on ``layer.metadata`` when present
+    (OME-Zarr often stores anisotropic Z,Y,X scale only there while napari leaves
+    ``layer.scale`` at ``(1, 1, 1)``).
+    """
+    meta = getattr(layer, "metadata", None) or {}
+    ngff = ngff_finest_voxel_spacing_zyx(meta)
+    if ngff is not None:
+        return ngff
     sc = np.asarray(layer.scale, dtype=np.float64).ravel()
     if sc.size < 3:
         return (1.0, 1.0, 1.0)
     s = sc[-3:].copy()
     s[s <= 0] = 1.0
     return (float(s[0]), float(s[1]), float(s[2]))
+
+
+def ngff_scale_zyx_from_transforms(
+    transforms: Any,
+) -> Optional[Tuple[float, float, float]]:
+    """Extract ``(s_z, s_y, s_x)`` from one NGFF ``coordinateTransformations`` list."""
+    if not isinstance(transforms, list):
+        return None
+    for entry in transforms:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")).lower() != "scale":
+            continue
+        raw = entry.get("scale")
+        if raw is None:
+            continue
+        sc = np.asarray(raw, dtype=np.float64).ravel()
+        if sc.size < 3:
+            continue
+        s = sc[-3:].copy()
+        if np.any(s <= 0) or not np.all(np.isfinite(s)):
+            continue
+        return (float(s[0]), float(s[1]), float(s[2]))
+    return None
+
+
+def ngff_finest_voxel_spacing_zyx(metadata: Any) -> Optional[Tuple[float, float, float]]:
+    """Finest-level physical spacing from napari/OME-Zarr ``metadata`` dict."""
+    if not isinstance(metadata, dict):
+        return None
+    cts = metadata.get("coordinateTransformations")
+    if not isinstance(cts, list) or len(cts) == 0:
+        return None
+    level0 = cts[0]
+    if isinstance(level0, list):
+        return ngff_scale_zyx_from_transforms(level0)
+    if isinstance(level0, dict):
+        return ngff_scale_zyx_from_transforms([level0])
+    return None
 
 
 def voxel_spacing_zyx_for_level(

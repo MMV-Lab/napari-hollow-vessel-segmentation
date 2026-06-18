@@ -33,6 +33,7 @@ from regiongrow._preprocessing_zarr import (  # noqa: WPS433 (internal import ok
 from regiongrow._zarr_compat import (
     zarr_array_keys,
     zarr_create_array,
+    zarr_open_group_append,
     zarr_output_codec_kwargs,
 )
 
@@ -170,7 +171,7 @@ def _open_existing_omezarr(store: str | Path) -> Tuple[Path, zarr.Group]:
             f"{p} is not an .ome.zarr store. Select the store root "
             "(mydata.ome.zarr), not a folder inside labels/."
         )
-    root = zarr.open_group(str(p), mode="a")
+    root = zarr_open_group_append(p)
     # Raises if the store has no readable NGFF multiscales image.
     _read_multiscales_datasets(root)
     return p, root

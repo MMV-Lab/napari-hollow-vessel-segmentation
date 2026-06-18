@@ -90,6 +90,35 @@ def zarr_output_codec_kwargs(
     return {}
 
 
+def zarr_open_group_append(path: str | Path) -> zarr.Group:
+    """Open an existing store for read/write, matching its on-disk ``zarr_format``."""
+    p = str(path)
+    probe = zarr.open_group(p, mode="r")
+    zfmt = zarr_format_of(probe)
+    return zarr.open_group(p, mode="a", zarr_format=zfmt)
+
+
+def _normalize_codec_kw_for_create_array(
+    codec_kw: Dict[str, Any], *, zfmt: int
+) -> Dict[str, Any]:
+    """Map v2-style ``compressor`` kwargs to v3 ``compressors`` when needed."""
+    out = dict(codec_kw)
+    if zfmt != 3:
+        return out
+    if "compressors" in out or "compressor" not in out:
+        if not out:
+            out.update(zarr_v3_blosc_kwargs())
+        return out
+    comp = out.pop("compressor")
+    if comp is None:
+        return out
+    if isinstance(comp, (list, tuple)):
+        out["compressors"] = list(comp)
+    else:
+        out["compressors"] = comp
+    return out
+
+
 def zarr_create_array(
     group: zarr.Group,
     name: str,
@@ -105,14 +134,16 @@ def zarr_create_array(
         del group[name]
     shape_n = tuple(int(x) for x in shape)
     chunks_n = tuple(max(1, int(c)) for c in chunks)
+    zfmt = zarr_format_of(group)
     if hasattr(group, "create_array"):
+        kw = _normalize_codec_kw_for_create_array(codec_kw, zfmt=zfmt)
         return group.create_array(
             name,
             shape=shape_n,
             chunks=chunks_n,
             dtype=dtype,
             overwrite=overwrite,
-            **codec_kw,
+            **kw,
         )
     if hasattr(group, "create_dataset"):
         return group.create_dataset(
