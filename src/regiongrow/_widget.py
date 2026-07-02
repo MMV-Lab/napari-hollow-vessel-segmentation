@@ -2118,9 +2118,10 @@ class RegionGrowWidget(QWidget):
             "  - Working pyramid level: keep the mask on the current grid (Layers → "
             "Pyramid level). Writes that level plus any coarser image pyramid levels "
             "(e.g. level 4 of 5 → arrays 0 and maybe 1, not five empty finer levels). "
-            "Lowest RAM.\n"
+            "Lowest RAM; recommended on limited hardware.\n"
             "  - Full finest resolution: upsample to the image finest grid and write a "
-            "full label pyramid (chunked; slower CPU, same quality as a full-res mask)."
+            "full label pyramid (chunked on disk). Peak RAM stays near the working mask "
+            "size; the store still grows to full finest size on disk (can be tens of GB)."
         )
         save_form.addRow("Save resolution:", _row(self.save_resolution_combo))
 
@@ -3203,15 +3204,13 @@ class RegionGrowWidget(QWidget):
     def _snapshot_segmentation_for_save(
         self, seg_layer: Any, image_layer: Any, save_resolution: str
     ) -> np.ndarray:
-        """Dense mask array at the resolution we will write (handles multiscale labels)."""
+        """Dense mask on the working grid (finest upsample is chunked on write)."""
+        _ = save_resolution
         if not getattr(seg_layer, "multiscale", False):
             return (np.asarray(seg_layer.data) > 0).astype(np.uint8, copy=False)
-        if str(save_resolution) == "finest":
-            lvl = 0
-        else:
-            lvl = labels_pyramid_level_for_image_level(
-                seg_layer, image_layer, int(self._selected_pyramid_level())
-            )
+        lvl = labels_pyramid_level_for_image_level(
+            seg_layer, image_layer, int(self._selected_pyramid_level())
+        )
         return (materialize_labels_level(seg_layer, lvl) > 0).astype(
             np.uint8, copy=False
         )
