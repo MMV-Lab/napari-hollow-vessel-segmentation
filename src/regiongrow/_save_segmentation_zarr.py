@@ -70,7 +70,7 @@ def _existing_label_names(root: zarr.Group, layout: Layout) -> List[str]:
 def _next_versioned_name(existing: List[str], base: str = "segmentation") -> str:
     if base not in existing:
         return base
-    n = 2
+    n = 2           
     while f"{base}_v{n}" in existing:
         n += 1
     return f"{base}_v{n}"

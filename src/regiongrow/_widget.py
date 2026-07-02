@@ -41,9 +41,11 @@ from scipy.ndimage import (
 )
 
 from ._spatial import (
+    scale_translate_zyx_from_spatial_kwargs,
     spatial_alignment_for_pyramid_level,
     spatial_alignment_kwargs,
     world_bounds_zyx_for_pyramid_level,
+    world_to_voxel_indices_zyx,
 )
 from ._image_display import (
     copy_multiscale_source_display_to_proxy,
@@ -227,38 +229,42 @@ def _voxel_spacing_zyx(image_layer: Any) -> tuple:
     return tuple(float(x) for x in s)
 
 
-def _points_world_to_image_zyx(
-    image_layer: Any, points_layer: Any, shape: tuple
+def _branch_points_to_working_grid_zyx(
+    image_layer: Any,
+    points_layer: Any,
+    level: int,
+    shape_work: tuple,
 ) -> np.ndarray:
-    """Map user points to integer ``(z, y, x)`` indices on *image_layer*.
+    """Map branch points to integer ZYX indices on the working pyramid grid.
 
-    ``Points.data`` lives in the points layer's data coordinate system, not
-    necessarily world space.  We convert ``data → world`` with the points
-    layer, then ``world → data`` with the image layer so downsampling,
-    anisotropic scale, and translate match the selected image grid.
+    Uses world coordinates and the same per-level ``scale`` / ``translate`` as
+    segmentation overlays (:func:`spatial_alignment_for_pyramid_level`), so face
+    slices (first/last Z) align with what the user sees at the selected pyramid
+    level — not finest indices rescaled by downsample factors.
     """
     pts = np.asarray(points_layer.data, dtype=np.float64)
     if pts.ndim == 1:
         pts = pts.reshape(1, -1)
-    out = np.zeros((pts.shape[0], 3), dtype=np.int64)
-    zmax, ymax, xmax = int(shape[0]) - 1, int(shape[1]) - 1, int(shape[2]) - 1
+    if pts.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    skw = spatial_alignment_for_pyramid_level(image_layer, int(level))
+    translate, scale = scale_translate_zyx_from_spatial_kwargs(skw)
+    worlds: List[np.ndarray] = []
     for i in range(pts.shape[0]):
         row = np.asarray(pts[i], dtype=np.float64).ravel()
         if row.size < 3:
             raise ValueError("Each point must have at least 3 coordinates.")
-        world = np.asarray(
-            points_layer.data_to_world(row[:3]), dtype=np.float64
-        ).ravel()
-        data_xyz = np.asarray(
-            image_layer.world_to_data(world), dtype=np.float64
-        ).ravel()
-        out[i, 0] = int(np.round(data_xyz[0]))
-        out[i, 1] = int(np.round(data_xyz[1]))
-        out[i, 2] = int(np.round(data_xyz[2]))
-        out[i, 0] = int(np.clip(out[i, 0], 0, max(zmax, 0)))
-        out[i, 1] = int(np.clip(out[i, 1], 0, max(ymax, 0)))
-        out[i, 2] = int(np.clip(out[i, 2], 0, max(xmax, 0)))
-    return out
+        worlds.append(
+            np.asarray(points_layer.data_to_world(row[:3]), dtype=np.float64).ravel()[
+                :3
+            ]
+        )
+    return world_to_voxel_indices_zyx(
+        np.stack(worlds, axis=0),
+        translate=translate,
+        scale=scale,
+        shape=shape_work,
+    )
 
 
 def _is_auto_sized_branch_points_name(name: str) -> bool:
@@ -558,6 +564,14 @@ class RegionGrowWidget(QWidget):
         self._active_branch_job = None
         self._branch_pts_sync = None
         self._branch_step_target_layer = None
+        self._grow_view_transition = False
+        self._pending_grow_step_result: Optional[Any] = None
+        self._ndisplay_sync_timer = QTimer(self)
+        self._ndisplay_sync_timer.setSingleShot(True)
+        self._ndisplay_sync_timer.setInterval(50)
+        self._ndisplay_sync_timer.timeout.connect(
+            self._finish_ndisplay_sync_during_grow
+        )
 
         self._growth_capture_frames: List[np.ndarray] = []
         self._growth_capture_step_counter = 0
@@ -1327,7 +1341,7 @@ class RegionGrowWidget(QWidget):
         self.ms_2d_multiscale_render_check = QCheckBox(
             "Enable multiscale rendering in 2D"
         )
-        self.ms_2d_multiscale_render_check.setChecked(True)
+        self.ms_2d_multiscale_render_check.setChecked(False)
         self.ms_2d_multiscale_render_check.setVisible(False)
         self.ms_2d_multiscale_render_check.setToolTip(
             "When enabled, napari switches pyramid levels automatically as you zoom "
@@ -1832,10 +1846,20 @@ class RegionGrowWidget(QWidget):
         grow_row.addWidget(self.btn_merge_branch_seg)
         seg_form.addRow(grow_row)
 
-        seg_ctrl = QHBoxLayout()
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setEnabled(False)
+        seg_ctrl = QVBoxLayout()
+        seg_ctrl.setContentsMargins(0, 0, 0, 0)
+        seg_ctrl.setSpacing(4)
         seg_ctrl.addWidget(self.btn_stop)
+        self.merge_cleanup_check = QCheckBox("CleanUp")
+        self.merge_cleanup_check.setChecked(True)
+        self.merge_cleanup_check.setToolTip(
+            "After **Merge Branch**, remove archived Draft_Branch (N) layers and "
+            "extra BranchPoints_N layers. Keeps a single empty Draft_Branch and "
+            "empty BranchPoints ready for the next branch."
+        )
+        seg_ctrl.addWidget(self.merge_cleanup_check)
         seg_form.addRow(seg_ctrl)
 
         layout.addWidget(
@@ -2132,21 +2156,23 @@ class RegionGrowWidget(QWidget):
             return
         self._sync_layers_after_pyramid_working_level_change()
 
-    def _resync_branch_points_to_finest_image_grid(self) -> None:
-        """Re-align BranchPoints* with the image so world positions stay fixed (finest data indices)."""
+    def _resync_branch_points_to_working_grid(self) -> None:
+        """Re-align BranchPoints* to the working pyramid grid (world-fixed)."""
         iname = self._selected_image_layer_name()
         if not iname or iname not in self.viewer.layers:
             return
         img = self.viewer.layers[iname]
         if not isinstance(img, napari.layers.Image):
             return
-        skw = spatial_alignment_kwargs(img)
-        shape_fine = image_finest_shape(img)
-        if len(shape_fine) != 3:
+        level = int(self._selected_pyramid_level())
+        try:
+            shape_work = tuple(int(x) for x in image_level_shape(img, level))
+        except (TypeError, ValueError, IndexError):
             return
-        zmx = max(int(shape_fine[0]) - 1, 0)
-        ymx = max(int(shape_fine[1]) - 1, 0)
-        xmx = max(int(shape_fine[2]) - 1, 0)
+        if len(shape_work) != 3:
+            return
+        skw = spatial_alignment_for_pyramid_level(img, level)
+        translate, scale = scale_translate_zyx_from_spatial_kwargs(skw)
         for lyr in list(self.viewer.layers):
             if not isinstance(lyr, napari.layers.Points):
                 continue
@@ -2169,17 +2195,10 @@ class RegionGrowWidget(QWidget):
                 continue
             world = np.stack(world_rows, axis=0)
             _apply_spatial_kwargs_to_layer(lyr, skw)
-            new_rows: List[List[float]] = []
-            for wi in range(world.shape[0]):
-                d = np.asarray(img.world_to_data(world[wi]), dtype=np.float64).ravel()[:3]
-                new_rows.append(
-                    [
-                        float(np.clip(np.round(d[0]), 0, zmx)),
-                        float(np.clip(np.round(d[1]), 0, ymx)),
-                        float(np.clip(np.round(d[2]), 0, xmx)),
-                    ]
-                )
-            lyr.data = np.asarray(new_rows, dtype=np.float64)
+            grid = world_to_voxel_indices_zyx(
+                world, translate=translate, scale=scale, shape=shape_work
+            )
+            lyr.data = grid.astype(np.float64)
             self._sync_branch_point_features_layer(lyr)
         self._sync_branch_point_bases_from_image()
         self._on_camera_for_branch_points()
@@ -2228,7 +2247,7 @@ class RegionGrowWidget(QWidget):
         if len(shp) != 3:
             return
 
-        self._resync_branch_points_to_finest_image_grid()
+        self._resync_branch_points_to_working_grid()
 
         if DRAFT_BRANCH_LAYER_NAME in self.viewer.layers:
             dlyr = self.viewer.layers[DRAFT_BRANCH_LAYER_NAME]
@@ -2362,7 +2381,14 @@ class RegionGrowWidget(QWidget):
         steps = pyramid_axis_steps(img, level)
         if steps == (1, 1, 1):
             return None
-        scales = np.asarray(img.scale, dtype=np.float64).ravel()
+        try:
+            shp = tuple(int(x) for x in image_level_shape(img, level))
+            scales = np.asarray(
+                voxel_spacing_zyx_for_level(img, level, shp[-3:]),
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError, IndexError):
+            scales = np.asarray(img.scale, dtype=np.float64).ravel()
         if scales.size < 3:
             scales = np.array([1.0, 1.0, 1.0])
         scales = scales[-3:].copy()
@@ -2375,16 +2401,18 @@ class RegionGrowWidget(QWidget):
             if int(step_vox) <= 1:
                 continue
             axis = z_axis + i
-            world_step = max(float(step_vox) * float(scales[i]), float(scales[i]))
+            lo_b, hi_b = bounds[i]
+            lo, hi = float(lo_b), float(hi_b)
             if display is not None:
                 try:
                     ext = display.extent.world
-                    lo = float(ext[0, axis])
-                    hi = float(ext[1, axis])
+                    lo_d = float(ext[0, axis])
+                    hi_d = float(ext[1, axis])
+                    lo = min(lo, lo_d)
+                    hi = max(hi, hi_d)
                 except (AttributeError, IndexError, TypeError, ValueError):
-                    lo, hi = bounds[i]
-            else:
-                lo, hi = bounds[i]
+                    pass
+            world_step = max(float(step_vox) * float(scales[i]), float(scales[i]))
             out.append((axis, lo, hi, world_step))
         return out or None
 
@@ -2637,8 +2665,34 @@ class RegionGrowWidget(QWidget):
             ):
                 _ensure_blocker_labels_ndim3(lyr)
 
-        # 2D/3D display: multiscale auto-render vs fixed pyramid level.
+        # While Compute Branch is running, defer proxy/volume rebuilds so VisPy is not
+        # updating label textures in the same draw pass as the 2D↔3D canvas switch.
+        if getattr(self, "_active_branch_job", None) == "grow":
+            self._grow_view_transition = True
+            self._ndisplay_sync_timer.start()
+            return
+
         self._update_pyramid_display_layers()
+
+    def _finish_ndisplay_sync_during_grow(self) -> None:
+        """Apply deferred pyramid proxies after a 2D↔3D switch during grow."""
+        try:
+            self._update_pyramid_display_layers()
+        finally:
+            self._grow_view_transition = False
+            self._apply_pending_grow_step()
+
+    def _apply_pending_grow_step(self) -> None:
+        pending = self._pending_grow_step_result
+        self._pending_grow_step_result = None
+        if pending is not None:
+            self._on_step(pending)
+
+    def _clear_grow_view_transition_state(self) -> None:
+        self._grow_view_transition = False
+        self._pending_grow_step_result = None
+        if getattr(self, "_ndisplay_sync_timer", None) is not None:
+            self._ndisplay_sync_timer.stop()
 
     def _update_postprocess_button(self):
         name = self._selected_image_layer_name()
@@ -3329,7 +3383,9 @@ class RegionGrowWidget(QWidget):
         if not name or name not in self.viewer.layers:
             self.status_label.setText("Select an image layer first.")
             return
-        spatial_kw = spatial_alignment_kwargs(self.viewer.layers[name])
+        spatial_kw = spatial_alignment_for_pyramid_level(
+            img, self._selected_pyramid_level()
+        )
         img = self.viewer.layers[name]
         self._ensure_default_segmentation_mask_for_image(img, select=True)
         bname = self._allocate_extra_branch_points_name()
@@ -3484,6 +3540,111 @@ class RegionGrowWidget(QWidget):
         self.status_label.setText(msg)
         self._update_postprocess_button()
         self._schedule_autosave_after_merge()
+        if self.merge_cleanup_check.isChecked():
+            self._cleanup_layers_after_merge()
+            self.status_label.setText(msg + " Cleaned up branch preview and points.")
+
+    def _cleanup_layers_after_merge(self) -> None:
+        """Leave a single empty Draft_Branch and BranchPoints after merge."""
+        image_layer = self._get_image_layer()
+        if image_layer is None:
+            return
+        level = int(self._selected_pyramid_level())
+        try:
+            shape_work = tuple(
+                int(x) for x in image_level_shape(image_layer, level)
+            )
+        except (TypeError, ValueError, IndexError):
+            shape_work = ()
+        if len(shape_work) == 3:
+            self._cleanup_draft_branch_layers_after_merge(
+                image_layer, shape_work, level
+            )
+        self._cleanup_branch_points_layers_after_merge()
+
+    def _cleanup_draft_branch_layers_after_merge(
+        self, image_layer: Any, shape_work: tuple, level: int
+    ) -> None:
+        for lyr in list(self.viewer.layers):
+            if not isinstance(lyr, napari.layers.Labels):
+                continue
+            if not _is_branch_draft_labels_name(lyr.name):
+                continue
+            if lyr.name == DRAFT_BRANCH_LAYER_NAME:
+                continue
+            try:
+                self.viewer.layers.remove(lyr.name)
+            except Exception:
+                pass
+        dlyr = self._ensure_draft_branch_layer(image_layer, shape_work, level)
+        dlyr.data = np.zeros(shape_work, dtype=np.int32)
+        self._refresh_draft_branch_combo()
+        _select_combo_layer(self.draft_branch_combo, DRAFT_BRANCH_LAYER_NAME)
+
+    def _ensure_empty_default_branch_points_layer(self) -> None:
+        """Single empty ``BranchPoints`` layer on the current image grid."""
+        import pandas as pd
+
+        keep_name = "BranchPoints"
+        img = self._get_image_layer()
+        if img is not None:
+            spatial_kw = spatial_alignment_for_pyramid_level(
+                img, self._selected_pyramid_level()
+            )
+            base = _suggested_branch_point_base_size(img)
+        else:
+            spatial_kw = {}
+            base = 12.0
+        self._branch_point_size_bases.setdefault(keep_name, base)
+        if keep_name in self.viewer.layers:
+            lyr = self.viewer.layers[keep_name]
+            if isinstance(lyr, napari.layers.Points):
+                lyr.data = np.empty((0, 3))
+                lyr.features = pd.DataFrame()
+                _apply_spatial_kwargs_to_layer(lyr, spatial_kw)
+                self._wire_branch_points_sync(lyr)
+                try:
+                    lyr.visible = True
+                except Exception:
+                    pass
+            return
+        bcolor = self._register_branch_points_layer_color(keep_name)
+        pts = self.viewer.add_points(
+            np.empty((0, 3)),
+            ndim=3,
+            name=keep_name,
+            size=base,
+            features=pd.DataFrame(),
+            face_color=bcolor,
+            border_color="white",
+            **spatial_kw,
+        )
+        pts.mode = "add"
+        self._wire_branch_points_sync(pts)
+
+    def _cleanup_branch_points_layers_after_merge(self) -> None:
+        keep_name = "BranchPoints"
+        for lyr in list(self.viewer.layers):
+            if not isinstance(lyr, napari.layers.Points):
+                continue
+            if not _is_auto_sized_branch_points_name(lyr.name):
+                continue
+            if lyr.name == keep_name:
+                continue
+            if (
+                getattr(self, "_branch_pts_sync", None)
+                and self._branch_pts_sync[0] is lyr
+            ):
+                self._branch_pts_sync = None
+            self._branch_point_size_bases.pop(lyr.name, None)
+            try:
+                self.viewer.layers.remove(lyr.name)
+            except Exception:
+                pass
+        self._ensure_empty_default_branch_points_layer()
+        self._refresh_layers_now()
+        _select_combo_layer(self.branch_combo, keep_name)
+        self._on_branch_combo_color_target()
 
     def _schedule_autosave_after_merge(self) -> None:
         """Debounced background checkpoint to ``labels/segmentation_autosave``."""
@@ -4318,11 +4479,8 @@ class RegionGrowWidget(QWidget):
             )
             return
 
-        poly_fine = _points_world_to_image_zyx(
-            image_layer, branch_layer, shape_fine
-        )
-        branch_idx = _polyline_indices_for_level(
-            poly_fine, image_layer, level, shape_work
+        branch_idx = _branch_points_to_working_grid_zyx(
+            image_layer, branch_layer, level, shape_work
         )
         if branch_idx.shape[0] < 2:
             self.status_label.setText(
@@ -4637,6 +4795,7 @@ class RegionGrowWidget(QWidget):
         self.status_label.setText("Growing…")
 
     def _on_worker_error(self, exc):
+        self._clear_grow_view_transition_state()
         self._finish_branch_grow_preview_if_needed()
         self.btn_stop.setEnabled(False)
         self.btn_grow_branches.setEnabled(True)
@@ -4646,6 +4805,12 @@ class RegionGrowWidget(QWidget):
         self._branch_step_target_layer = None
 
     def _on_step(self, result):
+        if getattr(self, "_grow_view_transition", False):
+            self._pending_grow_step_result = result
+            return
+        self._apply_grow_step_result(result)
+
+    def _apply_grow_step_result(self, result: Any) -> None:
         if isinstance(result, tuple) and len(result) == 2 and result[0] == "error":
             self.status_label.setText(str(result[1]))
             return
@@ -4688,6 +4853,7 @@ class RegionGrowWidget(QWidget):
             return
 
     def _on_finished(self):
+        self._clear_grow_view_transition_state()
         self.btn_stop.setEnabled(False)
         self.btn_grow_branches.setEnabled(True)
         self.progress_bar.hide()
@@ -4724,6 +4890,7 @@ class RegionGrowWidget(QWidget):
     def _stop(self):
         if self._worker is not None:
             self._worker.quit()
+        self._clear_grow_view_transition_state()
         self._finish_branch_grow_preview_if_needed()
         self.btn_stop.setEnabled(False)
         self.btn_grow_branches.setEnabled(True)
@@ -4738,6 +4905,7 @@ class RegionGrowWidget(QWidget):
             self._camera_points_timer.stop()
             self._refresh_layers_timer.stop()
             self._autosave_timer.stop()
+            self._ndisplay_sync_timer.stop()
         except Exception:
             pass
         if self._worker is not None:

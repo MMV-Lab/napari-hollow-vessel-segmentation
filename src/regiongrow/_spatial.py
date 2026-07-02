@@ -7,6 +7,47 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+def scale_translate_zyx_from_spatial_kwargs(
+    spatial_kwargs: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Last three ``translate`` / ``scale`` entries as ZYX vectors."""
+    trans = np.asarray(
+        spatial_kwargs.get("translate", 0), dtype=np.float64
+    ).ravel()
+    scale = np.asarray(spatial_kwargs.get("scale", 1), dtype=np.float64).ravel()
+    if trans.size < 3:
+        trans = np.pad(trans, (3 - trans.size, 0), constant_values=0.0)
+    if scale.size < 3:
+        scale = np.pad(scale, (3 - scale.size, 0), constant_values=1.0)
+    s3 = scale[-3:].copy()
+    s3[s3 <= 0] = 1.0
+    return trans[-3:].copy(), s3
+
+
+def world_to_voxel_indices_zyx(
+    world: np.ndarray,
+    *,
+    translate: np.ndarray,
+    scale: np.ndarray,
+    shape: Tuple[int, ...],
+) -> np.ndarray:
+    """Map world positions to integer ZYX voxel indices on a layer grid."""
+    w = np.asarray(world, dtype=np.float64).reshape(-1, 3)
+    t3 = np.asarray(translate, dtype=np.float64).reshape(3)
+    s3 = np.asarray(scale, dtype=np.float64).reshape(3)
+    s3[s3 <= 0] = 1.0
+    shp = tuple(int(x) for x in shape)[-3:]
+    if len(shp) != 3:
+        raise ValueError(f"shape must be 3-D ZYX; got {shape!r}")
+    zmax, ymax, xmax = (max(shp[i] - 1, 0) for i in range(3))
+    d = (w - t3.reshape(1, 3)) / s3.reshape(1, 3)
+    out = np.rint(d).astype(np.int64)
+    out[:, 0] = np.clip(out[:, 0], 0, zmax)
+    out[:, 1] = np.clip(out[:, 1], 0, ymax)
+    out[:, 2] = np.clip(out[:, 2], 0, xmax)
+    return out
+
+
 def spatial_alignment_kwargs(ref_layer: Any) -> Dict[str, Any]:
     """Return kwargs so a new layer shares *ref_layer*'s data→world transform.
 
