@@ -149,13 +149,28 @@ def _branch_points_color_for_layer_name(name: str) -> str:
     return BRANCH_POINTS_COLOR_CYCLE[idx % len(BRANCH_POINTS_COLOR_CYCLE)]
 
 
-def _draft_branch_archive_color(name: str) -> str:
-    """Fallback palette slot for archived ``Draft_Branch (N)`` layers."""
-    m = re.match(r"^Draft_Branch \((\d+)\)$", str(name).strip())
+def _draft_branch_color_for_layer_name(
+    name: str,
+    *,
+    branch_points_name: Optional[str] = None,
+) -> str:
+    """Palette slot for live or archived ``Draft_Branch*`` preview labels."""
+    nm = str(name).strip()
+    if nm == DRAFT_BRANCH_LAYER_NAME:
+        bp = str(branch_points_name or "").strip()
+        if bp and _is_auto_sized_branch_points_name(bp):
+            return _branch_points_color_for_layer_name(bp)
+        return DEFAULT_BRANCH_POINTS_COLOR
+    m = re.match(r"^Draft_Branch \((\d+)\)$", nm)
     if m:
         k = int(m.group(1))
         return BRANCH_POINTS_COLOR_CYCLE[k % len(BRANCH_POINTS_COLOR_CYCLE)]
     return DEFAULT_BRANCH_POINTS_COLOR
+
+
+def _draft_branch_archive_color(name: str) -> str:
+    """Palette slot for archived ``Draft_Branch (N)`` (matches ``BranchPoints_N``)."""
+    return _draft_branch_color_for_layer_name(name)
 
 
 def _sanitize_branch_display_color(color: str) -> str:
@@ -740,25 +755,24 @@ class RegionGrowWidget(QWidget):
 
     def _draft_branch_labels_color(self, name: str) -> str:
         """Color for a branch preview labels layer (live or archived)."""
-        nm = str(name).strip()
-        if nm == DRAFT_BRANCH_LAYER_NAME:
-            return self._draft_branch_preview_color()
-        if _is_branch_draft_labels_name(nm):
-            stored = self._layer_display_colors.get(nm)
-            if stored:
-                return _sanitize_branch_display_color(str(stored))
-            return _draft_branch_archive_color(nm)
-        return DEFAULT_BRANCH_POINTS_COLOR
+        bname = self.branch_combo.currentText().strip()
+        return _draft_branch_color_for_layer_name(
+            name, branch_points_name=bname
+        )
 
     def _sync_draft_branch_labels_colors(self) -> None:
+        bname = self.branch_combo.currentText().strip()
         for lyr in self.viewer.layers:
             if not isinstance(lyr, napari.layers.Labels):
                 continue
-            if not _is_branch_draft_labels_name(str(lyr.name)):
+            nm = str(lyr.name)
+            if not _is_branch_draft_labels_name(nm):
                 continue
-            self._apply_stored_labels_color(
-                lyr, self._draft_branch_labels_color(str(lyr.name))
+            color = _draft_branch_color_for_layer_name(
+                nm, branch_points_name=bname
             )
+            self._set_layer_color(nm, color)
+            self._apply_stored_labels_color(lyr, color)
 
     def _reset_branch_workflow_colors_after_merge(self) -> None:
         """Restart branch palette at cyan (BranchPoints + Draft_Branch)."""
@@ -828,11 +842,7 @@ class RegionGrowWidget(QWidget):
         self._color_target = "branch"
         self._sync_color_combo_from_target()
         self._sync_all_branch_points_palette_colors()
-        if DRAFT_BRANCH_LAYER_NAME in self.viewer.layers:
-            self._apply_stored_labels_color(
-                self.viewer.layers[DRAFT_BRANCH_LAYER_NAME],
-                self._draft_branch_preview_color(),
-            )
+        self._sync_draft_branch_labels_colors()
 
     def _on_branch_trunk_combo_color_target(self, *_args: Any) -> None:
         self._color_target = "segmentation"
@@ -876,9 +886,9 @@ class RegionGrowWidget(QWidget):
 
     def _draft_branch_preview_color(self) -> str:
         bname = self.branch_combo.currentText().strip()
-        if bname and _is_auto_sized_branch_points_name(bname):
-            return _branch_points_color_for_layer_name(bname)
-        return DEFAULT_BRANCH_POINTS_COLOR
+        return _draft_branch_color_for_layer_name(
+            DRAFT_BRANCH_LAYER_NAME, branch_points_name=bname
+        )
 
     def _segmentation_label_color(self) -> str:
         name = _combo_layer_name(self.branch_trunk_combo)
@@ -2394,7 +2404,7 @@ class RegionGrowWidget(QWidget):
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
         archived_name = f"{base} ({k})"
-        archived_color = self._draft_branch_preview_color()
+        archived_color = _draft_branch_color_for_layer_name(archived_name)
         lyr.name = archived_name
         self._set_layer_color(archived_name, archived_color)
         self._apply_stored_labels_color(lyr, archived_color)
@@ -4477,7 +4487,7 @@ class RegionGrowWidget(QWidget):
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
         archived_name = f"{base} ({k})"
-        archived_color = self._draft_branch_preview_color()
+        archived_color = _draft_branch_color_for_layer_name(archived_name)
         lyr.name = archived_name
         self._set_layer_color(archived_name, archived_color)
         self._apply_stored_labels_color(lyr, archived_color)
@@ -5141,6 +5151,7 @@ class RegionGrowWidget(QWidget):
         if job == "grow" and not err:
             self._refresh_draft_branch_combo()
             _select_combo_layer(self.draft_branch_combo, DRAFT_BRANCH_LAYER_NAME)
+            self._sync_draft_branch_labels_colors()
             if enc_started:
                 self.status_label.setText(
                     f'Preview written to "{DRAFT_BRANCH_LAYER_NAME}". Encoding GIF in background…'
