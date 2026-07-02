@@ -1581,7 +1581,8 @@ class RegionGrowWidget(QWidget):
         self.branch_plain_step_spin.setToolTip(
             "Animate branch plain growth every N accepted voxels when Animate growth is on."
         )
-        self._vis_plain_step_field = _row(self.branch_plain_step_spin)
+        self._vis_plain_step_field = QWidget()
+        self._vis_plain_step_field.setLayout(_row(self.branch_plain_step_spin))
         vis_form.addRow(self._vis_plain_step_label, self._vis_plain_step_field)
 
         self._vis_ac_yield_label = QLabel("Every N iterations:")
@@ -1591,7 +1592,8 @@ class RegionGrowWidget(QWidget):
         self.branch_ac_yield_spin.setToolTip(
             "Refresh the viewer every N MGAC iterations when Animate growth is on."
         )
-        self._vis_ac_yield_field = _row(self.branch_ac_yield_spin)
+        self._vis_ac_yield_field = QWidget()
+        self._vis_ac_yield_field.setLayout(_row(self.branch_ac_yield_spin))
         vis_form.addRow(self._vis_ac_yield_label, self._vis_ac_yield_field)
 
         self.seg_color_combo = QComboBox()
