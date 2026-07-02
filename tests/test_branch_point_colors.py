@@ -21,3 +21,13 @@ def test_branch_points_color_index_and_cycle() -> None:
     )
     assert "magenta" not in BRANCH_POINTS_COLOR_CYCLE
     assert _sanitize_branch_display_color("magenta") == DEFAULT_BRANCH_POINTS_COLOR
+
+
+def test_draft_branch_archive_color_rotates() -> None:
+    from regiongrow._widget import (
+        BRANCH_POINTS_COLOR_CYCLE,
+        _draft_branch_archive_color,
+    )
+
+    assert _draft_branch_archive_color("Draft_Branch (1)") == BRANCH_POINTS_COLOR_CYCLE[1]
+    assert _draft_branch_archive_color("Draft_Branch (2)") == BRANCH_POINTS_COLOR_CYCLE[2]

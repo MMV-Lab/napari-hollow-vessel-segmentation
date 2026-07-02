@@ -149,6 +149,15 @@ def _branch_points_color_for_layer_name(name: str) -> str:
     return BRANCH_POINTS_COLOR_CYCLE[idx % len(BRANCH_POINTS_COLOR_CYCLE)]
 
 
+def _draft_branch_archive_color(name: str) -> str:
+    """Fallback palette slot for archived ``Draft_Branch (N)`` layers."""
+    m = re.match(r"^Draft_Branch \((\d+)\)$", str(name).strip())
+    if m:
+        k = int(m.group(1))
+        return BRANCH_POINTS_COLOR_CYCLE[k % len(BRANCH_POINTS_COLOR_CYCLE)]
+    return DEFAULT_BRANCH_POINTS_COLOR
+
+
 def _sanitize_branch_display_color(color: str) -> str:
     """Branch / draft preview colors never use reserved segmentation magenta."""
     c = str(color).strip()
@@ -714,6 +723,43 @@ class RegionGrowWidget(QWidget):
         self._set_layer_color(layer_name, color)
         return color
 
+    def _apply_branch_points_palette_color(self, layer_name: str) -> None:
+        """Apply the fixed palette slot for ``BranchPoints`` / ``BranchPoints_N``."""
+        if not _is_auto_sized_branch_points_name(layer_name):
+            return
+        color = _branch_points_color_for_layer_name(layer_name)
+        self._set_layer_color(layer_name, color)
+        self._apply_color_to_layer_name(layer_name, color)
+
+    def _sync_all_branch_points_palette_colors(self) -> None:
+        for lyr in self.viewer.layers:
+            if isinstance(lyr, napari.layers.Points) and _is_auto_sized_branch_points_name(
+                lyr.name
+            ):
+                self._apply_branch_points_palette_color(str(lyr.name))
+
+    def _draft_branch_labels_color(self, name: str) -> str:
+        """Color for a branch preview labels layer (live or archived)."""
+        nm = str(name).strip()
+        if nm == DRAFT_BRANCH_LAYER_NAME:
+            return self._draft_branch_preview_color()
+        if _is_branch_draft_labels_name(nm):
+            stored = self._layer_display_colors.get(nm)
+            if stored:
+                return _sanitize_branch_display_color(str(stored))
+            return _draft_branch_archive_color(nm)
+        return DEFAULT_BRANCH_POINTS_COLOR
+
+    def _sync_draft_branch_labels_colors(self) -> None:
+        for lyr in self.viewer.layers:
+            if not isinstance(lyr, napari.layers.Labels):
+                continue
+            if not _is_branch_draft_labels_name(str(lyr.name)):
+                continue
+            self._apply_stored_labels_color(
+                lyr, self._draft_branch_labels_color(str(lyr.name))
+            )
+
     def _reset_branch_workflow_colors_after_merge(self) -> None:
         """Restart branch palette at cyan (BranchPoints + Draft_Branch)."""
         default = DEFAULT_BRANCH_POINTS_COLOR
@@ -751,11 +797,15 @@ class RegionGrowWidget(QWidget):
         if not name:
             return
         default = (
-            DEFAULT_BRANCH_POINTS_COLOR
-            if self._color_target == "branch"
+            _branch_points_color_for_layer_name(name)
+            if self._color_target == "branch" and name
             else DEFAULT_SEGMENTATION_COLOR
         )
-        color = _sanitize_branch_display_color(self._layer_color(name, default))
+        color = _sanitize_branch_display_color(
+            self._layer_color(name, default)
+        )
+        if self._color_target == "branch" and name:
+            color = _branch_points_color_for_layer_name(name)
         choices = (
             LAYER_COLOR_CHOICES
             if self._color_target == "segmentation"
@@ -777,6 +827,12 @@ class RegionGrowWidget(QWidget):
     def _on_branch_combo_color_target(self, *_args: Any) -> None:
         self._color_target = "branch"
         self._sync_color_combo_from_target()
+        self._sync_all_branch_points_palette_colors()
+        if DRAFT_BRANCH_LAYER_NAME in self.viewer.layers:
+            self._apply_stored_labels_color(
+                self.viewer.layers[DRAFT_BRANCH_LAYER_NAME],
+                self._draft_branch_preview_color(),
+            )
 
     def _on_branch_trunk_combo_color_target(self, *_args: Any) -> None:
         self._color_target = "segmentation"
@@ -821,8 +877,7 @@ class RegionGrowWidget(QWidget):
     def _draft_branch_preview_color(self) -> str:
         bname = self.branch_combo.currentText().strip()
         if bname and _is_auto_sized_branch_points_name(bname):
-            stored = self._layer_color(bname, _branch_points_color_for_layer_name(bname))
-            return _sanitize_branch_display_color(stored)
+            return _branch_points_color_for_layer_name(bname)
         return DEFAULT_BRANCH_POINTS_COLOR
 
     def _segmentation_label_color(self) -> str:
@@ -1496,11 +1551,11 @@ class RegionGrowWidget(QWidget):
         _configure_form_layout(vis_form)
 
         self.animate_check = QCheckBox("Animate growth")
-        self.animate_check.setChecked(True)
+        self.animate_check.setChecked(False)
         self.animate_check.setToolTip(
             "Show the growing contour at each display step.\n"
             "Disable for maximum speed.\n"
-            "Update frequency is set under Segmentation parameters (Plain / MGAC)."
+            "Update frequency is set below (Plain / MGAC)."
         )
         self.capture_growth_check = QCheckBox("Capture animation (GIF)")
         self.capture_growth_check.setChecked(False)
@@ -1518,6 +1573,26 @@ class RegionGrowWidget(QWidget):
         anim_cap_layout.addWidget(self.capture_growth_check)
         anim_cap_layout.addStretch(1)
         vis_form.addRow(anim_cap_row)
+
+        self._vis_plain_step_label = QLabel("Every N voxels:")
+        self.branch_plain_step_spin = QSpinBox()
+        self.branch_plain_step_spin.setRange(1, 10000)
+        self.branch_plain_step_spin.setValue(500)
+        self.branch_plain_step_spin.setToolTip(
+            "Animate branch plain growth every N accepted voxels when Animate growth is on."
+        )
+        self._vis_plain_step_field = _row(self.branch_plain_step_spin)
+        vis_form.addRow(self._vis_plain_step_label, self._vis_plain_step_field)
+
+        self._vis_ac_yield_label = QLabel("Every N iterations:")
+        self.branch_ac_yield_spin = QSpinBox()
+        self.branch_ac_yield_spin.setRange(1, 500)
+        self.branch_ac_yield_spin.setValue(5)
+        self.branch_ac_yield_spin.setToolTip(
+            "Refresh the viewer every N MGAC iterations when Animate growth is on."
+        )
+        self._vis_ac_yield_field = _row(self.branch_ac_yield_spin)
+        vis_form.addRow(self._vis_ac_yield_label, self._vis_ac_yield_field)
 
         self.seg_color_combo = QComboBox()
         self.seg_color_combo.addItems(list(LAYER_COLOR_CHOICES))
@@ -1809,14 +1884,6 @@ class RegionGrowWidget(QWidget):
         )
         branch_plain_form.addRow("Threshold method:", _row(self.branch_plain_upper_thr_combo))
 
-        self.branch_plain_step_spin = QSpinBox()
-        self.branch_plain_step_spin.setRange(1, 10000)
-        self.branch_plain_step_spin.setValue(500)
-        self.branch_plain_step_spin.setToolTip(
-            "Animate branch plain growth every N accepted voxels when Animate growth is on."
-        )
-        branch_plain_form.addRow("Every N voxels:", _row(self.branch_plain_step_spin))
-
         branch_ac_inner = QWidget()
         branch_ac_form = QFormLayout(branch_ac_inner)
         self.branch_ac_section = _collapsible_section(
@@ -1880,14 +1947,6 @@ class RegionGrowWidget(QWidget):
         self.branch_ac_total_iter_spin.setValue(40)
         self.branch_ac_total_iter_spin.setToolTip("Total MGAC iterations (branch only).")
         branch_ac_form.addRow("Total iterations:", _row(self.branch_ac_total_iter_spin))
-
-        self.branch_ac_yield_spin = QSpinBox()
-        self.branch_ac_yield_spin.setRange(1, 500)
-        self.branch_ac_yield_spin.setValue(5)
-        self.branch_ac_yield_spin.setToolTip(
-            "Refresh the viewer every N MGAC iterations when Animate growth is on."
-        )
-        branch_ac_form.addRow("Every N iterations:", _row(self.branch_ac_yield_spin))
 
         self.branch_ac_early_stop_row = QWidget()
         early_stop_layout = QHBoxLayout(self.branch_ac_early_stop_row)
@@ -2333,9 +2392,10 @@ class RegionGrowWidget(QWidget):
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
         archived_name = f"{base} ({k})"
-        archived_color = self._layer_color(name, self._draft_branch_preview_color())
+        archived_color = self._draft_branch_preview_color()
         lyr.name = archived_name
         self._set_layer_color(archived_name, archived_color)
+        self._apply_stored_labels_color(lyr, archived_color)
         self._refresh_draft_branch_combo()
 
     def _sync_layers_after_pyramid_working_level_change(self) -> None:
@@ -2671,6 +2731,8 @@ class RegionGrowWidget(QWidget):
                 del self._layer_display_colors[k]
         self._refresh_branch_trunk_combo()
         self._refresh_draft_branch_combo()
+        self._sync_all_branch_points_palette_colors()
+        self._sync_draft_branch_labels_colors()
         self._sync_branch_point_bases_from_image()
         self._prune_empty_archived_draft_layers()
         iname = self._selected_image_layer_name()
@@ -3545,6 +3607,7 @@ class RegionGrowWidget(QWidget):
         )
         pts.mode = "add"
         self._wire_branch_points_sync(pts)
+        self._apply_branch_points_palette_color(bname)
         self._refresh_layers_now()
         _select_combo_layer(self.branch_combo, bname)
         self._on_branch_combo_color_target()
@@ -3567,6 +3630,10 @@ class RegionGrowWidget(QWidget):
         self.branch_plain_section.setVisible(is_plain)
         self.branch_ac_section.setVisible(is_ac)
         self.branch_ac_early_stop_row.setVisible(is_ac)
+        self._vis_plain_step_label.setVisible(is_plain)
+        self._vis_plain_step_field.setVisible(is_plain)
+        self._vis_ac_yield_label.setVisible(is_ac)
+        self._vis_ac_yield_field.setVisible(is_ac)
 
     def _ensure_draft_branch_layer(
         self, image_layer: Any, shape: tuple, pyramid_level: int
@@ -4297,6 +4364,7 @@ class RegionGrowWidget(QWidget):
                 if j >= 0:
                     cb.setCurrentIndex(j)
         cb.blockSignals(False)
+        self._sync_draft_branch_labels_colors()
 
     def _refresh_branch_trunk_combo(self) -> None:
         """Repopulate trunk-mask combo with Labels layers on the current image grid."""
@@ -4407,9 +4475,10 @@ class RegionGrowWidget(QWidget):
         while f"{base} ({k})" in self.viewer.layers:
             k += 1
         archived_name = f"{base} ({k})"
-        archived_color = self._layer_color(name, self._draft_branch_preview_color())
+        archived_color = self._draft_branch_preview_color()
         lyr.name = archived_name
         self._set_layer_color(archived_name, archived_color)
+        self._apply_stored_labels_color(lyr, archived_color)
         self._refresh_draft_branch_combo()
 
     def _finish_branch_grow_preview_if_needed(self) -> None:
