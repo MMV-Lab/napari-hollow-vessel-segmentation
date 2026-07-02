@@ -369,8 +369,14 @@ def _ensure_blocker_labels_ndim3(lyr: Any) -> None:
         pass
 
 
-def _suggested_branch_point_base_size(image_layer: Any) -> float:
-    """Marker diameter in Points *data* coordinates for a readable default on huge volumes."""
+def _suggested_branch_point_base_size(
+    image_layer: Any, pyramid_level: int = 0
+) -> float:
+    """Marker diameter in Points *data* coordinates for a readable default on huge volumes.
+
+    Sized for the working pyramid grid so markers stay consistent in world units
+    across levels (coarser grids use smaller data-space radii).
+    """
     shape = image_finest_shape(image_layer)
     if len(shape) >= 3:
         m = float(min(int(shape[-3]), int(shape[-2]), int(shape[-1])))
@@ -378,8 +384,13 @@ def _suggested_branch_point_base_size(image_layer: Any) -> float:
         m = float(min(int(s) for s in shape))
     else:
         m = 128.0
-    # Slightly smaller than before for cleaner overlays; cap avoids extreme GPU paths.
-    return float(max(22.0, min(m * 0.020, 420.0)))
+    base_finest = float(max(22.0, min(m * 0.020, 420.0)))
+    lvl = int(pyramid_level)
+    if lvl <= 0:
+        return base_finest
+    fz, fy, fx = pyramid_axis_steps(image_layer, lvl)
+    f_min = float(min(fz, fy, fx))
+    return float(max(8.0, base_finest / max(f_min, 1.0)))
 
 
 # Max width for the plugin dock content (prevents napari from widening the sidebar).
@@ -604,6 +615,7 @@ class RegionGrowWidget(QWidget):
         self._load_segmentation_worker = None
         self._dims_nav_override = False
         self._saved_dims_range: Optional[tuple] = None
+        self._merge_cleanup_status_msg: Optional[str] = None
         self._dims_nav_applying = False
         self._pyramid_dims_nav_timer = QTimer(self)
         self._pyramid_dims_nav_timer.setSingleShot(True)
@@ -2112,7 +2124,7 @@ class RegionGrowWidget(QWidget):
             self._on_multiscale_working_level_changed
         )
         self.ms_2d_multiscale_render_check.toggled.connect(
-            self._update_pyramid_display_layers
+            self._on_ms_2d_multiscale_render_toggled
         )
         self.ms_2d_multiscale_render_check.toggled.connect(
             self._apply_pyramid_dims_navigation
@@ -2134,6 +2146,21 @@ class RegionGrowWidget(QWidget):
         self.viewer.camera.events.center.connect(self._on_camera_for_branch_points)
 
     # -------------------------------------------------------- layer helpers --
+    def _on_ms_2d_multiscale_render_toggled(self, *_args: Any) -> None:
+        self._branch_point_zoom_ref = None
+        self._update_pyramid_display_layers()
+        self._sync_branch_point_bases_from_image()
+
+    def _branch_points_use_camera_zoom_scaling(self) -> bool:
+        """Only napari auto-multiscale 2D needs zoom-compensated marker sizes."""
+        try:
+            nd = int(self.viewer.dims.ndisplay)
+        except Exception:
+            nd = 2
+        if nd >= 3:
+            return False
+        return not self._use_fixed_2d_pyramid_level()
+
     def _selected_pyramid_level(self) -> int:
         if not self.ms_level_combo.isVisible() or self.ms_level_combo.count() == 0:
             return 0
@@ -2153,6 +2180,7 @@ class RegionGrowWidget(QWidget):
                     proxy_name, pyramid_level=int(old_level)
                 )
         self._last_pyramid_level = new_level
+        self._branch_point_zoom_ref = None
         self._refresh_branch_trunk_combo()
         self._update_pyramid_display_layers()
         self._apply_pyramid_dims_navigation()
@@ -2603,6 +2631,7 @@ class RegionGrowWidget(QWidget):
     def _sync_branch_point_bases_from_image(self) -> None:
         """Assign default marker sizes for BranchPoints* from the current image extent."""
         iname = self._selected_image_layer_name()
+        level = int(self._selected_pyramid_level())
         if not iname or iname not in self.viewer.layers:
             self._apply_camera_branch_point_sizes()
             return
@@ -2610,14 +2639,14 @@ class RegionGrowWidget(QWidget):
         if not isinstance(img, napari.layers.Image):
             self._apply_camera_branch_point_sizes()
             return
-        base = _suggested_branch_point_base_size(img)
+        base = _suggested_branch_point_base_size(img, level)
         sel = self.branch_combo.currentText()
         for lyr in self.viewer.layers:
             if not isinstance(lyr, napari.layers.Points):
                 continue
             if not _is_auto_sized_branch_points_name(lyr.name):
                 continue
-            self._branch_point_size_bases.setdefault(lyr.name, base)
+            self._branch_point_size_bases[lyr.name] = base
         self._apply_camera_branch_point_sizes(active_name=sel or None)
 
     def _on_camera_for_branch_points(self, event=None) -> None:
@@ -2627,7 +2656,29 @@ class RegionGrowWidget(QWidget):
     def _apply_camera_branch_point_sizes(
         self, *, active_name: Optional[str] = None
     ) -> None:
-        """Keep the active BranchPoints layer marker diameter ~stable on screen."""
+        """Keep BranchPoints markers stable on screen (auto-multiscale 2D only)."""
+        if active_name is None:
+            active_name = self.branch_combo.currentText()
+        if not self._branch_points_use_camera_zoom_scaling():
+            for lyr in self.viewer.layers:
+                if not isinstance(lyr, napari.layers.Points):
+                    continue
+                if not _is_auto_sized_branch_points_name(lyr.name):
+                    continue
+                if active_name and lyr.name != active_name:
+                    continue
+                if len(lyr.data) == 0:
+                    continue
+                base = self._branch_point_size_bases.get(lyr.name)
+                if base is None:
+                    continue
+                new_size = float(np.clip(base, 8.0, 900.0))
+                if len(lyr.size):
+                    cur = float(np.max(lyr.size))
+                    if abs(cur - new_size) <= max(0.5, 0.02 * new_size):
+                        continue
+                lyr.size = new_size
+            return
         try:
             z = float(self.viewer.camera.zoom)
         except (TypeError, ValueError):
@@ -2637,9 +2688,7 @@ class RegionGrowWidget(QWidget):
         if self._branch_point_zoom_ref is None:
             self._branch_point_zoom_ref = z
         z0 = float(self._branch_point_zoom_ref)
-        scale = z / max(z0, 1e-9)
-        if active_name is None:
-            active_name = self.branch_combo.currentText()
+        scale = z0 / max(z, 1e-9)
         for lyr in self.viewer.layers:
             if not isinstance(lyr, napari.layers.Points):
                 continue
@@ -3395,7 +3444,7 @@ class RegionGrowWidget(QWidget):
         )
         self._ensure_default_segmentation_mask_for_image(img, select=True)
         bname = self._allocate_extra_branch_points_name()
-        base = _suggested_branch_point_base_size(img)
+        base = _suggested_branch_point_base_size(img, self._selected_pyramid_level())
         self._branch_point_size_bases[bname] = base
         bcolor = self._register_branch_points_layer_color(bname)
         empty_feat = pd.DataFrame()
@@ -3547,8 +3596,20 @@ class RegionGrowWidget(QWidget):
         self._update_postprocess_button()
         self._schedule_autosave_after_merge()
         if self.merge_cleanup_check.isChecked():
+            self._merge_cleanup_status_msg = (
+                msg + " Cleaned up branch preview and points."
+            )
+            QTimer.singleShot(0, self._run_deferred_merge_cleanup)
+
+    def _run_deferred_merge_cleanup(self) -> None:
+        """Run merge cleanup after the current VisPy draw cycle (avoids texture race)."""
+        try:
             self._cleanup_layers_after_merge()
-            self.status_label.setText(msg + " Cleaned up branch preview and points.")
+        finally:
+            msg = getattr(self, "_merge_cleanup_status_msg", None)
+            if msg:
+                self.status_label.setText(msg)
+            self._merge_cleanup_status_msg = None
 
     def _cleanup_layers_after_merge(self) -> None:
         """Leave a single empty Draft_Branch and BranchPoints after merge."""
@@ -3579,6 +3640,10 @@ class RegionGrowWidget(QWidget):
             if lyr.name == DRAFT_BRANCH_LAYER_NAME:
                 continue
             try:
+                lyr.visible = False
+            except Exception:
+                pass
+            try:
                 self.viewer.layers.remove(lyr.name)
             except Exception:
                 pass
@@ -3597,7 +3662,7 @@ class RegionGrowWidget(QWidget):
             spatial_kw = spatial_alignment_for_pyramid_level(
                 img, self._selected_pyramid_level()
             )
-            base = _suggested_branch_point_base_size(img)
+            base = _suggested_branch_point_base_size(img, self._selected_pyramid_level())
         else:
             spatial_kw = {}
             base = 12.0
@@ -3643,6 +3708,10 @@ class RegionGrowWidget(QWidget):
             ):
                 self._branch_pts_sync = None
             self._branch_point_size_bases.pop(lyr.name, None)
+            try:
+                lyr.visible = False
+            except Exception:
+                pass
             try:
                 self.viewer.layers.remove(lyr.name)
             except Exception:
