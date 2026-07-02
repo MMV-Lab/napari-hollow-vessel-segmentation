@@ -3389,10 +3389,10 @@ class RegionGrowWidget(QWidget):
         if not name or name not in self.viewer.layers:
             self.status_label.setText("Select an image layer first.")
             return
+        img = self.viewer.layers[name]
         spatial_kw = spatial_alignment_for_pyramid_level(
             img, self._selected_pyramid_level()
         )
-        img = self.viewer.layers[name]
         self._ensure_default_segmentation_mask_for_image(img, select=True)
         bname = self._allocate_extra_branch_points_name()
         base = _suggested_branch_point_base_size(img)
