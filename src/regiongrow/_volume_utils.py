@@ -257,6 +257,41 @@ def pyramid_axis_steps(layer: Any, level: int) -> Tuple[int, int, int]:
     return (max(1, int(round(fz))), max(1, int(round(fy))), max(1, int(round(fx))))
 
 
+def pyramid_navigation_axis_ranges_zyx(
+    layer: Any, level: int
+) -> Tuple[
+    Optional[Tuple[float, float, float]],
+    Optional[Tuple[float, float, float]],
+    Optional[Tuple[float, float, float]],
+]:
+    """World ``(lo, hi, step)`` per Z, Y, X for coarse pyramid dims navigation.
+
+    ``lo``/``hi`` follow the **working** pyramid level (matches displayed voxels).
+    ``step`` is ``downsample_factor × finest_spacing`` so each tick is one
+    working-level plane without overshooting past the last valid slice.
+    """
+    from regiongrow._spatial import world_bounds_zyx_for_pyramid_level
+
+    steps = pyramid_axis_steps(layer, int(level))
+    if steps == (1, 1, 1):
+        return (None, None, None)
+    finest = voxel_spacing_zyx_finest(layer)
+    work_bounds = world_bounds_zyx_for_pyramid_level(layer, int(level))
+    out: List[Optional[Tuple[float, float, float]]] = []
+    for i in range(3):
+        step_vox = int(steps[i])
+        if step_vox <= 1:
+            out.append(None)
+            continue
+        lo_b, hi_b = work_bounds[i]
+        fs = float(finest[i])
+        if fs <= 0:
+            fs = 1.0
+        world_step = max(float(step_vox) * fs, fs)
+        out.append((float(lo_b), float(hi_b), world_step))
+    return (out[0], out[1], out[2])
+
+
 def is_lazy_array(x: Any) -> bool:
     if da is not None and isinstance(x, da.Array):
         return True

@@ -65,3 +65,70 @@ def test_default_pyramid_level_index_prefers_three_when_available() -> None:
     assert default_pyramid_level_index(2) == 1
     assert default_pyramid_level_index(4) == 3
     assert default_pyramid_level_index(10) == 3
+
+
+def _z_slider_tick_count(lo: float, hi: float, step: float) -> int:
+    """Discrete napari dims positions along one axis (inclusive endpoints)."""
+    if step <= 0 or hi < lo:
+        return 0
+    k_max = int(round((hi - lo) / step))
+    return k_max + 1
+
+
+def test_pyramid_z_navigation_matches_working_level_planes() -> None:
+    """Adapt-Z step must match coarse Z depth; finest-only range adds black slices."""
+    from regiongrow._spatial import world_bounds_zyx_for_pyramid_level
+    from regiongrow._volume_utils import (
+        image_level_shape,
+        pyramid_axis_steps,
+        pyramid_navigation_axis_ranges_zyx,
+        voxel_spacing_zyx_finest,
+    )
+
+    lyr = _FakeMultiscaleImage()
+    level = 2
+    nav = pyramid_navigation_axis_ranges_zyx(lyr, level)[0]
+    assert nav is not None
+    z_lo, z_hi, world_step = nav
+    assert pyramid_axis_steps(lyr, level)[0] == 4
+    assert world_step == 4 * voxel_spacing_zyx_finest(lyr)[0]
+    n_ticks = _z_slider_tick_count(z_lo, z_hi, world_step)
+    assert n_ticks == image_level_shape(lyr, level)[0]
+
+    finest_lo, finest_hi = world_bounds_zyx_for_pyramid_level(lyr, 0)[0]
+    n_finest_range = _z_slider_tick_count(
+        finest_lo, finest_hi, world_step
+    )
+    assert n_finest_range > n_ticks
+
+    class _WideZ:
+        multiscale = True
+        ndim = 3
+        scale = (1.0, 1.0, 1.0)
+        downsample_factors = [
+            np.array([1.0, 1.0, 1.0]),
+            np.array([2.0, 2.0, 2.0]),
+            np.array([4.0, 4.0, 4.0]),
+            np.array([8.0, 8.0, 8.0]),
+        ]
+        data = [
+            np.zeros((530, 100, 100), dtype=np.uint8),
+            np.zeros((265, 50, 50), dtype=np.uint8),
+            np.zeros((132, 25, 25), dtype=np.uint8),
+            np.zeros((67, 13, 13), dtype=np.uint8),
+        ]
+
+    wide = _WideZ()
+    for level in (2, 3):
+        nav_z = pyramid_navigation_axis_ranges_zyx(wide, level)[0]
+        assert nav_z is not None
+        lo, hi, step = nav_z
+        n_ticks = _z_slider_tick_count(lo, hi, step)
+        assert n_ticks == image_level_shape(wide, level)[0]
+
+    step_z = pyramid_axis_steps(wide, 3)[0]
+    z_fine = voxel_spacing_zyx_finest(wide)[0]
+    wrong_step = step_z * z_fine * step_z
+    finest_lo, finest_hi = world_bounds_zyx_for_pyramid_level(wide, 0)[0]
+    n_wrong = _z_slider_tick_count(finest_lo, finest_hi, wrong_step)
+    assert n_wrong <= 10

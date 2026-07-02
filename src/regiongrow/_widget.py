@@ -71,6 +71,7 @@ from ._volume_utils import (
     multiscale_level_label,
     multiscale_level_tooltip,
     pyramid_axis_steps,
+    pyramid_navigation_axis_ranges_zyx,
     tube_radius_voxels_for_work_level,
     voxel_spacing_zyx_for_level,
 )
@@ -641,6 +642,12 @@ class RegionGrowWidget(QWidget):
         try:
             self.viewer.dims.events.range.connect(
                 self._on_dims_range_changed_for_pyramid_nav
+            )
+            self.viewer.dims.events.point.connect(
+                self._on_dims_point_changed_for_pyramid_nav
+            )
+            self.viewer.dims.events.current_step.connect(
+                self._on_dims_point_changed_for_pyramid_nav
             )
         except AttributeError:
             pass
@@ -2378,42 +2385,14 @@ class RegionGrowWidget(QWidget):
         if img is None:
             return None
         level = int(self._selected_pyramid_level())
-        steps = pyramid_axis_steps(img, level)
-        if steps == (1, 1, 1):
-            return None
-        try:
-            shp = tuple(int(x) for x in image_level_shape(img, level))
-            scales = np.asarray(
-                voxel_spacing_zyx_for_level(img, level, shp[-3:]),
-                dtype=np.float64,
-            )
-        except (TypeError, ValueError, IndexError):
-            scales = np.asarray(img.scale, dtype=np.float64).ravel()
-        if scales.size < 3:
-            scales = np.array([1.0, 1.0, 1.0])
-        scales = scales[-3:].copy()
-        scales[scales <= 0] = 1.0
+        axis_ranges = pyramid_navigation_axis_ranges_zyx(img, level)
         z_axis = max(0, int(getattr(img, "ndim", 3)) - 3)
-        bounds = world_bounds_zyx_for_pyramid_level(img, level)
-        display = self._display_layer_for_pyramid_navigation()
         out: List[Tuple[int, float, float, float]] = []
-        for i, step_vox in enumerate(steps):
-            if int(step_vox) <= 1:
+        for i, rng in enumerate(axis_ranges):
+            if rng is None:
                 continue
-            axis = z_axis + i
-            lo_b, hi_b = bounds[i]
-            lo, hi = float(lo_b), float(hi_b)
-            if display is not None:
-                try:
-                    ext = display.extent.world
-                    lo_d = float(ext[0, axis])
-                    hi_d = float(ext[1, axis])
-                    lo = min(lo, lo_d)
-                    hi = max(hi, hi_d)
-                except (AttributeError, IndexError, TypeError, ValueError):
-                    pass
-            world_step = max(float(step_vox) * float(scales[i]), float(scales[i]))
-            out.append((axis, lo, hi, world_step))
+            lo, hi, world_step = rng
+            out.append((z_axis + i, lo, hi, world_step))
         return out or None
 
     def _pyramid_dims_world_steps(self) -> Optional[List[Tuple[int, float]]]:
@@ -2446,6 +2425,14 @@ class RegionGrowWidget(QWidget):
                 self._schedule_pyramid_dims_navigation()
                 return
 
+    def _on_dims_point_changed_for_pyramid_nav(self, event=None) -> None:
+        """Keep dims.point on valid coarse-grid slices (no black past last plane)."""
+        if getattr(self, "_dims_nav_applying", False):
+            return
+        if not getattr(self, "_dims_nav_override", False):
+            return
+        self._clamp_dims_point_to_ranges()
+
     def _reset_pyramid_dims_navigation(self) -> None:
         if not self._dims_nav_override:
             return
@@ -2470,22 +2457,41 @@ class RegionGrowWidget(QWidget):
         dims = self.viewer.dims
         pt = [float(x) for x in dims.point]
         changed = False
+        plan = self._pyramid_dims_navigation_plan()
+        plan_by_axis = (
+            {axis: (lo, hi, st) for axis, lo, hi, st in plan} if plan else {}
+        )
         for ax in range(int(dims.ndim)):
             try:
-                lo, hi, _st = dims.range[ax]
+                lo, hi, st = dims.range[ax]
             except (IndexError, TypeError, ValueError):
                 continue
-            if pt[ax] < float(lo):
-                pt[ax] = float(lo)
+            if ax in plan_by_axis:
+                lo, hi, st = plan_by_axis[ax]
+            lo_f, hi_f, st_f = float(lo), float(hi), float(st or 0.0)
+            if ax in plan_by_axis and st_f > 0:
+                k_max = int(round((hi_f - lo_f) / st_f))
+                k = int(round((pt[ax] - lo_f) / st_f))
+                k = min(max(k, 0), k_max)
+                snapped = lo_f + k * st_f
+                if abs(pt[ax] - snapped) > 1e-6:
+                    pt[ax] = snapped
+                    changed = True
+                continue
+            if pt[ax] < lo_f:
+                pt[ax] = lo_f
                 changed = True
-            elif pt[ax] > float(hi):
-                pt[ax] = float(hi)
+            elif pt[ax] > hi_f:
+                pt[ax] = hi_f
                 changed = True
         if changed:
             try:
+                self._dims_nav_applying = True
                 dims.point = pt
             except Exception:
                 pass
+            finally:
+                self._dims_nav_applying = False
 
     def _apply_pyramid_dims_navigation(self, *_args: Any) -> None:
         """Widen napari dims step on Z (and Y/X) when browsing a coarse pyramid grid."""
@@ -4929,6 +4935,12 @@ class RegionGrowWidget(QWidget):
         try:
             self.viewer.dims.events.range.disconnect(
                 self._on_dims_range_changed_for_pyramid_nav
+            )
+            self.viewer.dims.events.point.disconnect(
+                self._on_dims_point_changed_for_pyramid_nav
+            )
+            self.viewer.dims.events.current_step.disconnect(
+                self._on_dims_point_changed_for_pyramid_nav
             )
         except Exception:
             pass
