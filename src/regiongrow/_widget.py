@@ -125,10 +125,36 @@ BRANCH_LAYER_COLOR_CHOICES: tuple[str, ...] = tuple(
     c for c in LAYER_COLOR_CHOICES if c != "magenta"
 )
 
+DRAFT_BRANCH_COLOR_CHOICES: tuple[str, ...] = BRANCH_LAYER_COLOR_CHOICES
+
 DEFAULT_SEGMENTATION_COLOR = "magenta"
 DEFAULT_BRANCH_POINTS_COLOR = "cyan"
 
 BRANCH_POINTS_COLOR_CYCLE: tuple[str, ...] = BRANCH_LAYER_COLOR_CHOICES
+
+
+def _branch_points_layer_color_index(name: str) -> int:
+    """Stable palette slot: ``BranchPoints`` → 0, ``BranchPoints_1`` → 1, …"""
+    name = str(name).strip()
+    if name == "BranchPoints":
+        return 0
+    m = re.match(r"^BranchPoints_(\d+)$", name)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def _branch_points_color_for_layer_name(name: str) -> str:
+    idx = _branch_points_layer_color_index(name)
+    return BRANCH_POINTS_COLOR_CYCLE[idx % len(BRANCH_POINTS_COLOR_CYCLE)]
+
+
+def _sanitize_branch_display_color(color: str) -> str:
+    """Branch / draft preview colors never use reserved segmentation magenta."""
+    c = str(color).strip()
+    if c in DRAFT_BRANCH_COLOR_CHOICES:
+        return c
+    return DEFAULT_BRANCH_POINTS_COLOR
 
 
 def _binary_segmentation_colormap(foreground_color: str) -> DirectLabelColormap:
@@ -584,6 +610,15 @@ class RegionGrowWidget(QWidget):
         self._ndisplay_sync_timer.timeout.connect(
             self._finish_ndisplay_sync_during_grow
         )
+        self._merge_postprocess_timer = QTimer(self)
+        self._merge_postprocess_timer.setSingleShot(True)
+        self._merge_postprocess_timer.setInterval(50)
+        self._merge_postprocess_timer.timeout.connect(
+            self._run_deferred_merge_postprocess
+        )
+        self._merge_postprocess_payload: Optional[dict] = None
+        self._merge_layers_mutating = False
+        self._merge_ndisplay_deferred = False
 
         self._growth_capture_frames: List[np.ndarray] = []
         self._growth_capture_step_counter = 0
@@ -615,7 +650,6 @@ class RegionGrowWidget(QWidget):
         self._load_segmentation_worker = None
         self._dims_nav_override = False
         self._saved_dims_range: Optional[tuple] = None
-        self._merge_cleanup_status_msg: Optional[str] = None
         self._dims_nav_applying = False
         self._pyramid_dims_nav_timer = QTimer(self)
         self._pyramid_dims_nav_timer.setSingleShot(True)
@@ -675,18 +709,24 @@ class RegionGrowWidget(QWidget):
     def _set_layer_color(self, layer_name: str, color: str) -> None:
         self._layer_display_colors[str(layer_name)] = str(color).strip()
 
-    def _branch_points_color_for_new_layer(self) -> str:
-        n = sum(
-            1
-            for lyr in self.viewer.layers
-            if _is_auto_sized_branch_points_name(lyr.name)
-        )
-        return BRANCH_POINTS_COLOR_CYCLE[n % len(BRANCH_POINTS_COLOR_CYCLE)]
-
     def _register_branch_points_layer_color(self, layer_name: str) -> str:
-        color = self._branch_points_color_for_new_layer()
+        color = _branch_points_color_for_layer_name(layer_name)
         self._set_layer_color(layer_name, color)
         return color
+
+    def _reset_branch_workflow_colors_after_merge(self) -> None:
+        """Restart branch palette at cyan (BranchPoints + Draft_Branch)."""
+        default = DEFAULT_BRANCH_POINTS_COLOR
+        for nm in ("BranchPoints", DRAFT_BRANCH_LAYER_NAME):
+            self._set_layer_color(nm, default)
+            if nm in self.viewer.layers:
+                self._apply_color_to_layer_name(nm, default)
+        for key in list(self._layer_display_colors.keys()):
+            if _is_auto_sized_branch_points_name(key):
+                if key != "BranchPoints":
+                    self._layer_display_colors.pop(key, None)
+            elif _is_branch_draft_labels_name(key) and key != DRAFT_BRANCH_LAYER_NAME:
+                self._layer_display_colors.pop(key, None)
 
     def _register_segmentation_layer_color(
         self, layer_name: str, *, color: Optional[str] = None
@@ -715,11 +755,11 @@ class RegionGrowWidget(QWidget):
             if self._color_target == "branch"
             else DEFAULT_SEGMENTATION_COLOR
         )
-        color = self._layer_color(name, default)
+        color = _sanitize_branch_display_color(self._layer_color(name, default))
         choices = (
             LAYER_COLOR_CHOICES
             if self._color_target == "segmentation"
-            else BRANCH_LAYER_COLOR_CHOICES
+            else DRAFT_BRANCH_COLOR_CHOICES
         )
         if color not in choices:
             color = default
@@ -781,7 +821,8 @@ class RegionGrowWidget(QWidget):
     def _draft_branch_preview_color(self) -> str:
         bname = self.branch_combo.currentText().strip()
         if bname and _is_auto_sized_branch_points_name(bname):
-            return self._layer_color(bname, DEFAULT_BRANCH_POINTS_COLOR)
+            stored = self._layer_color(bname, _branch_points_color_for_layer_name(bname))
+            return _sanitize_branch_display_color(stored)
         return DEFAULT_BRANCH_POINTS_COLOR
 
     def _segmentation_label_color(self) -> str:
@@ -830,8 +871,41 @@ class RegionGrowWidget(QWidget):
         name = self._active_color_target_layer_name()
         if not name:
             return
+        if _is_auto_sized_branch_points_name(name):
+            color = _sanitize_branch_display_color(color)
         self._set_layer_color(name, color)
         self._apply_color_to_layer_name(name, color)
+        if (
+            _is_auto_sized_branch_points_name(name)
+            and name == self.branch_combo.currentText().strip()
+            and DRAFT_BRANCH_LAYER_NAME in self.viewer.layers
+        ):
+            self._apply_stored_labels_color(
+                self.viewer.layers[DRAFT_BRANCH_LAYER_NAME], color
+            )
+
+    def _merge_postprocess_active(self) -> bool:
+        """True while merge cleanup is queued or running."""
+        if getattr(self, "_merge_layers_mutating", False):
+            return True
+        if getattr(self, "_merge_postprocess_payload", None) is not None:
+            return True
+        tmr = getattr(self, "_merge_postprocess_timer", None)
+        return bool(tmr is not None and tmr.isActive())
+
+    def _safe_remove_viewer_layer(self, name: str) -> None:
+        """Hide a layer before removal (avoid VisPy/napari list races)."""
+        if not name or name not in self.viewer.layers:
+            return
+        lyr = self.viewer.layers[name]
+        try:
+            lyr.visible = False
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.remove(name)
+        except Exception:
+            pass
 
     def _forced_3d_layer_name(self, image_layer_name: str) -> str:
         return f"{image_layer_name} (3D view)"
@@ -2622,11 +2696,7 @@ class RegionGrowWidget(QWidget):
             except Exception:
                 continue
         for nm in to_remove:
-            if nm in self.viewer.layers:
-                try:
-                    self.viewer.layers.remove(nm)
-                except Exception:
-                    pass
+            self._safe_remove_viewer_layer(nm)
 
     def _sync_branch_point_bases_from_image(self) -> None:
         """Assign default marker sizes for BranchPoints* from the current image extent."""
@@ -2726,16 +2796,31 @@ class RegionGrowWidget(QWidget):
             self._grow_view_transition = True
             self._ndisplay_sync_timer.start()
             return
+        if self._merge_postprocess_active():
+            self._merge_ndisplay_deferred = True
+            self._ndisplay_sync_timer.start()
+            return
 
         self._update_pyramid_display_layers()
 
     def _finish_ndisplay_sync_during_grow(self) -> None:
-        """Apply deferred pyramid proxies after a 2D↔3D switch during grow."""
-        try:
-            self._update_pyramid_display_layers()
-        finally:
-            self._grow_view_transition = False
-            self._apply_pending_grow_step()
+        """Apply deferred pyramid proxies after a 2D↔3D switch during grow or merge."""
+        if getattr(self, "_active_branch_job", None) == "grow":
+            try:
+                if self._merge_postprocess_active():
+                    self._merge_ndisplay_deferred = True
+                    return
+                self._update_pyramid_display_layers()
+            finally:
+                self._grow_view_transition = False
+                self._apply_pending_grow_step()
+            return
+        if self._merge_postprocess_active():
+            self._merge_ndisplay_deferred = True
+            return
+        if getattr(self, "_merge_ndisplay_deferred", False):
+            self._merge_ndisplay_deferred = False
+        self._update_pyramid_display_layers()
 
     def _apply_pending_grow_step(self) -> None:
         pending = self._pending_grow_step_result
@@ -3574,9 +3659,8 @@ class RegionGrowWidget(QWidget):
         br_name = str(br.name)
         res = np.asarray(tgt.data, dtype=np.int32).copy()
         res[bsel] = np.maximum(res[bsel], np.asarray(br.data, dtype=np.int32)[bsel])
-        tgt.data = res
+        _update_labels_layer_data(tgt, res)
         self._apply_stored_labels_color(tgt)
-        br.data = np.zeros_like(res, dtype=np.int32)
         self._result_layer = tgt
         self._refresh_draft_branch_combo()
         msg = f'Merged "{br_name}" into "{tgt.name}"; preview cleared.'
@@ -3592,24 +3676,79 @@ class RegionGrowWidget(QWidget):
                     f" Combined GIF: +{len(pend)} frames "
                     f"(total {len(self._gif_capture_combined_frames)})."
                 )
+        cleanup = bool(self.merge_cleanup_check.isChecked())
+        status_after = msg + (
+            " Cleaned up branch preview and points." if cleanup else ""
+        )
         self.status_label.setText(msg)
         self._update_postprocess_button()
         self._schedule_autosave_after_merge()
-        if self.merge_cleanup_check.isChecked():
-            self._merge_cleanup_status_msg = (
-                msg + " Cleaned up branch preview and points."
-            )
-            QTimer.singleShot(0, self._run_deferred_merge_cleanup)
+        self._merge_postprocess_payload = {
+            "br_name": br_name,
+            "cleanup": cleanup,
+            "status_msg": status_after,
+        }
+        self._merge_postprocess_timer.start()
+
+    def _run_deferred_merge_postprocess(self) -> None:
+        """Clear branch preview / run CleanUp after the canvas finishes drawing."""
+        payload = self._merge_postprocess_payload
+        self._merge_postprocess_payload = None
+        if not payload:
+            return
+        if getattr(self, "_grow_view_transition", False) or (
+            getattr(self, "_ndisplay_sync_timer", None) is not None
+            and self._ndisplay_sync_timer.isActive()
+        ):
+            self._merge_postprocess_payload = payload
+            self._merge_postprocess_timer.start()
+            return
+        br_name = str(payload.get("br_name") or "")
+        cleanup = bool(payload.get("cleanup"))
+        self._merge_layers_mutating = True
+        try:
+            if br_name and br_name in self.viewer.layers:
+                will_remove = (
+                    cleanup
+                    and br_name != DRAFT_BRANCH_LAYER_NAME
+                    and _is_branch_draft_labels_name(br_name)
+                )
+                if not will_remove:
+                    br = self.viewer.layers[br_name]
+                    if isinstance(br, napari.layers.Labels):
+                        try:
+                            shp = tuple(int(x) for x in layer_data_shape(br))
+                            if len(shp) == 3:
+                                _update_labels_layer_data(
+                                    br, np.zeros(shp, dtype=np.int32)
+                                )
+                        except Exception:
+                            pass
+            if cleanup:
+                self._cleanup_layers_after_merge()
+        except Exception:
+            pass
+        finally:
+            self._merge_layers_mutating = False
+            status = payload.get("status_msg")
+            if status:
+                self.status_label.setText(str(status))
+            if cleanup:
+                QTimer.singleShot(50, self._finish_merge_ui_sync)
+            if getattr(self, "_merge_ndisplay_deferred", False):
+                self._merge_ndisplay_deferred = False
+                QTimer.singleShot(50, self._update_pyramid_display_layers)
+
+    def _finish_merge_ui_sync(self) -> None:
+        """Refresh dock combos after merge cleanup (debounced, post-canvas)."""
+        self._refresh_layers()
+        _select_combo_layer(self.branch_combo, "BranchPoints")
+        self._on_branch_combo_color_target()
+        _select_combo_layer(self.draft_branch_combo, DRAFT_BRANCH_LAYER_NAME)
 
     def _run_deferred_merge_cleanup(self) -> None:
-        """Run merge cleanup after the current VisPy draw cycle (avoids texture race)."""
-        try:
-            self._cleanup_layers_after_merge()
-        finally:
-            msg = getattr(self, "_merge_cleanup_status_msg", None)
-            if msg:
-                self.status_label.setText(msg)
-            self._merge_cleanup_status_msg = None
+        """Legacy alias — kept for any in-flight singleShot callbacks."""
+        self._run_deferred_merge_postprocess()
 
     def _cleanup_layers_after_merge(self) -> None:
         """Leave a single empty Draft_Branch and BranchPoints after merge."""
@@ -3628,6 +3767,7 @@ class RegionGrowWidget(QWidget):
                 image_layer, shape_work, level
             )
         self._cleanup_branch_points_layers_after_merge()
+        self._reset_branch_workflow_colors_after_merge()
 
     def _cleanup_draft_branch_layers_after_merge(
         self, image_layer: Any, shape_work: tuple, level: int
@@ -3639,18 +3779,9 @@ class RegionGrowWidget(QWidget):
                 continue
             if lyr.name == DRAFT_BRANCH_LAYER_NAME:
                 continue
-            try:
-                lyr.visible = False
-            except Exception:
-                pass
-            try:
-                self.viewer.layers.remove(lyr.name)
-            except Exception:
-                pass
+            self._safe_remove_viewer_layer(str(lyr.name))
         dlyr = self._ensure_draft_branch_layer(image_layer, shape_work, level)
-        dlyr.data = np.zeros(shape_work, dtype=np.int32)
-        self._refresh_draft_branch_combo()
-        _select_combo_layer(self.draft_branch_combo, DRAFT_BRANCH_LAYER_NAME)
+        _update_labels_layer_data(dlyr, np.zeros(shape_work, dtype=np.int32))
 
     def _ensure_empty_default_branch_points_layer(self) -> None:
         """Single empty ``BranchPoints`` layer on the current image grid."""
@@ -3674,6 +3805,10 @@ class RegionGrowWidget(QWidget):
                 lyr.features = pd.DataFrame()
                 _apply_spatial_kwargs_to_layer(lyr, spatial_kw)
                 self._wire_branch_points_sync(lyr)
+                self._set_layer_color(keep_name, DEFAULT_BRANCH_POINTS_COLOR)
+                self._apply_color_to_layer_name(
+                    keep_name, DEFAULT_BRANCH_POINTS_COLOR
+                )
                 try:
                     lyr.visible = True
                 except Exception:
@@ -3708,18 +3843,8 @@ class RegionGrowWidget(QWidget):
             ):
                 self._branch_pts_sync = None
             self._branch_point_size_bases.pop(lyr.name, None)
-            try:
-                lyr.visible = False
-            except Exception:
-                pass
-            try:
-                self.viewer.layers.remove(lyr.name)
-            except Exception:
-                pass
+            self._safe_remove_viewer_layer(str(lyr.name))
         self._ensure_empty_default_branch_points_layer()
-        self._refresh_layers_now()
-        _select_combo_layer(self.branch_combo, keep_name)
-        self._on_branch_combo_color_target()
 
     def _schedule_autosave_after_merge(self) -> None:
         """Debounced background checkpoint to ``labels/segmentation_autosave``."""
@@ -4981,6 +5106,7 @@ class RegionGrowWidget(QWidget):
             self._refresh_layers_timer.stop()
             self._autosave_timer.stop()
             self._ndisplay_sync_timer.stop()
+            self._merge_postprocess_timer.stop()
         except Exception:
             pass
         if self._worker is not None:
