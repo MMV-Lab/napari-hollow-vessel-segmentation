@@ -145,31 +145,30 @@ def _branch_points_layer_color_index(name: str) -> int:
 
 
 def _branch_points_color_for_layer_name(name: str) -> str:
-    idx = _branch_points_layer_color_index(name)
-    return BRANCH_POINTS_COLOR_CYCLE[idx % len(BRANCH_POINTS_COLOR_CYCLE)]
-
-
-def _draft_branch_color_for_layer_name(
-    name: str,
-    *,
-    branch_points_name: Optional[str] = None,
-) -> str:
-    """Palette slot for live or archived ``Draft_Branch*`` preview labels."""
-    nm = str(name).strip()
-    if nm == DRAFT_BRANCH_LAYER_NAME:
-        bp = str(branch_points_name or "").strip()
-        if bp and _is_auto_sized_branch_points_name(bp):
-            return _branch_points_color_for_layer_name(bp)
-        return DEFAULT_BRANCH_POINTS_COLOR
-    m = re.match(r"^Draft_Branch \((\d+)\)$", nm)
-    if m:
-        k = int(m.group(1))
-        return BRANCH_POINTS_COLOR_CYCLE[k % len(BRANCH_POINTS_COLOR_CYCLE)]
+    """All branch point layers share one color (typically only one is active)."""
+    _ = name
     return DEFAULT_BRANCH_POINTS_COLOR
 
 
+def _draft_branch_layer_color_index(name: str) -> int:
+    """Stable palette slot: ``Draft_Branch`` → 0, ``Draft_Branch (1)`` → 1, …"""
+    name = str(name).strip()
+    if name == DRAFT_BRANCH_LAYER_NAME:
+        return 0
+    m = re.match(r"^Draft_Branch \((\d+)\)$", name)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def _draft_branch_color_for_layer_name(name: str) -> str:
+    """Palette slot for live or archived ``Draft_Branch*`` preview labels."""
+    idx = _draft_branch_layer_color_index(name)
+    return BRANCH_POINTS_COLOR_CYCLE[idx % len(BRANCH_POINTS_COLOR_CYCLE)]
+
+
 def _draft_branch_archive_color(name: str) -> str:
-    """Palette slot for archived ``Draft_Branch (N)`` (matches ``BranchPoints_N``)."""
+    """Palette slot for archived ``Draft_Branch (N)`` layers."""
     return _draft_branch_color_for_layer_name(name)
 
 
@@ -189,18 +188,53 @@ def _binary_segmentation_colormap(foreground_color: str) -> DirectLabelColormap:
             1: str(foreground_color),
             None: "transparent",
         },
-        use_selection=True,
-        selection=1,
     )
 
 
+def _configure_binary_labels_layer(lyr: Any) -> None:
+    """Editable defaults for user-painted segmentation / draft preview masks."""
+    if not isinstance(lyr, napari.layers.Labels):
+        return
+    try:
+        lyr.editable = True
+        lyr.preserve_labels = False
+        if int(getattr(lyr, "ndim", 0)) >= 3:
+            lyr.n_edit_dimensions = 3
+    except Exception:
+        pass
+
+
+def _sync_binary_labels_colormap(lyr: Any, color: str) -> None:
+    """Apply mask color without resetting the user's selected label or erase mode."""
+    if not isinstance(lyr, napari.layers.Labels):
+        return
+    try:
+        lyr.colormap = _binary_segmentation_colormap(color)
+        lyr.colormap.use_selection = bool(getattr(lyr, "show_selected_label", False))
+        lyr.colormap.selection = int(getattr(lyr, "selected_label", 1))
+    except Exception:
+        pass
+
+
+def _init_binary_labels_layer(lyr: Any, color: str) -> None:
+    """One-time setup for a new editable binary mask layer."""
+    _configure_binary_labels_layer(lyr)
+    try:
+        lyr.selected_label = 1
+    except Exception:
+        pass
+    _sync_binary_labels_colormap(lyr, color)
+
+
 def _ensure_labels_show_selected(lyr: Any, *, label: int = 1) -> None:
-    """Keep napari's "show selected" enabled for plugin-managed binary mask layers."""
+    """Keep napari's "show selected" enabled for display-only preview layers."""
     if not isinstance(lyr, napari.layers.Labels):
         return
     try:
         lyr.selected_label = int(label)
         lyr.show_selected_label = True
+        lyr.colormap.use_selection = True
+        lyr.colormap.selection = int(label)
     except Exception:
         pass
 
@@ -739,7 +773,7 @@ class RegionGrowWidget(QWidget):
         return color
 
     def _apply_branch_points_palette_color(self, layer_name: str) -> None:
-        """Apply the fixed palette slot for ``BranchPoints`` / ``BranchPoints_N``."""
+        """Apply the shared branch-points color (all layers use cyan)."""
         if not _is_auto_sized_branch_points_name(layer_name):
             return
         color = _branch_points_color_for_layer_name(layer_name)
@@ -755,22 +789,16 @@ class RegionGrowWidget(QWidget):
 
     def _draft_branch_labels_color(self, name: str) -> str:
         """Color for a branch preview labels layer (live or archived)."""
-        bname = self.branch_combo.currentText().strip()
-        return _draft_branch_color_for_layer_name(
-            name, branch_points_name=bname
-        )
+        return _draft_branch_color_for_layer_name(name)
 
     def _sync_draft_branch_labels_colors(self) -> None:
-        bname = self.branch_combo.currentText().strip()
         for lyr in self.viewer.layers:
             if not isinstance(lyr, napari.layers.Labels):
                 continue
             nm = str(lyr.name)
             if not _is_branch_draft_labels_name(nm):
                 continue
-            color = _draft_branch_color_for_layer_name(
-                nm, branch_points_name=bname
-            )
+            color = _draft_branch_color_for_layer_name(nm)
             self._set_layer_color(nm, color)
             self._apply_stored_labels_color(lyr, color)
 
@@ -876,19 +904,11 @@ class RegionGrowWidget(QWidget):
         c = color or self._layer_color(
             str(lyr.name), DEFAULT_SEGMENTATION_COLOR
         )
-        try:
-            lyr.colormap = _binary_segmentation_colormap(c)
-        except Exception:
-            pass
-        nm = str(getattr(lyr, "name", ""))
-        if not _is_branch_draft_labels_name(nm) and not _is_blocker_labels_name(nm):
-            _ensure_labels_show_selected(lyr)
+        _configure_binary_labels_layer(lyr)
+        _sync_binary_labels_colormap(lyr, c)
 
     def _draft_branch_preview_color(self) -> str:
-        bname = self.branch_combo.currentText().strip()
-        return _draft_branch_color_for_layer_name(
-            DRAFT_BRANCH_LAYER_NAME, branch_points_name=bname
-        )
+        return _draft_branch_color_for_layer_name(DRAFT_BRANCH_LAYER_NAME)
 
     def _segmentation_label_color(self) -> str:
         name = _combo_layer_name(self.branch_trunk_combo)
@@ -1611,9 +1631,9 @@ class RegionGrowWidget(QWidget):
         self.seg_color_combo.setCurrentText(DEFAULT_SEGMENTATION_COLOR)
         self.seg_color_combo.setToolTip(
             "Color for the layer selected in Branch points layer or Segmentation mask. "
-            f"Magenta is reserved for segmentation; branch points and Draft_Branch use "
-            f"cyan → lime → yellow → … New segmentation layers default to "
-            f"{DEFAULT_SEGMENTATION_COLOR}."
+            f"Magenta is reserved for segmentation; all branch point layers use cyan. "
+            f"Draft_Branch preview colors rotate by layer name (cyan, lime, yellow, …). "
+            f"New segmentation layers default to {DEFAULT_SEGMENTATION_COLOR}."
         )
         vis_form.addRow("Layer color:", _row(self.seg_color_combo))
 
@@ -2973,7 +2993,9 @@ class RegionGrowWidget(QWidget):
                 opacity=0.5,
                 **spatial_alignment_kwargs(orig_layer),
             )
-            self._apply_stored_labels_color(lyr)
+            _init_binary_labels_layer(
+                lyr, self._layer_color(result_name, DEFAULT_SEGMENTATION_COLOR)
+            )
         self._result_layer = res_layer
         self.status_label.setText("Postprocessing complete: upsampled result created.")
 
@@ -3012,13 +3034,13 @@ class RegionGrowWidget(QWidget):
             nm = f"{nm_base} {k}"
             k += 1
         seg_color = self._register_segmentation_layer_color(nm)
-        self.viewer.add_labels(
+        lyr = self.viewer.add_labels(
             up,
             name=nm,
             opacity=0.5,
-            colormap=_binary_segmentation_colormap(seg_color),
             **spatial_alignment_for_pyramid_level(image_layer, target_level),
         )
+        _init_binary_labels_layer(lyr, seg_color)
         # Switch working level to the new finer grid and select it as merge target.
         try:
             self.ms_level_combo.setCurrentIndex(int(target_level))
@@ -3526,7 +3548,9 @@ class RegionGrowWidget(QWidget):
                 opacity=0.5,
                 **spatial_alignment_kwargs(res_layer),
             )
-            self._apply_stored_labels_color(lyr)
+            _init_binary_labels_layer(
+                lyr, self._layer_color(result_name, DEFAULT_SEGMENTATION_COLOR)
+            )
 
         self._result_layer = res_layer
         self.status_label.setText(
@@ -3659,6 +3683,7 @@ class RegionGrowWidget(QWidget):
             try:
                 lyr.opacity = 0.7
                 preview_color = self._draft_branch_preview_color()
+                _configure_binary_labels_layer(lyr)
                 self._apply_stored_labels_color(lyr, preview_color)
             except Exception:
                 pass
@@ -3668,9 +3693,9 @@ class RegionGrowWidget(QWidget):
             np.zeros(shape, dtype=np.int32),
             name=DRAFT_BRANCH_LAYER_NAME,
             opacity=0.7,
-            colormap=_binary_segmentation_colormap(preview_color),
             **skw,
         )
+        _init_binary_labels_layer(lyr, preview_color)
         return lyr
 
     def _reset_branch_segmentation(self) -> None:
@@ -4121,10 +4146,9 @@ class RegionGrowWidget(QWidget):
             np.zeros(shp, dtype=np.int32),
             name=nm,
             opacity=0.5,
-            colormap=_binary_segmentation_colormap(seg_color),
             **spatial_alignment_for_pyramid_level(image_layer, lvl),
         )
-        _ensure_labels_show_selected(lyr)
+        _init_binary_labels_layer(lyr, seg_color)
         return lyr
 
     def _replace_segmentation_layer_with_loaded_mask(
@@ -4153,6 +4177,7 @@ class RegionGrowWidget(QWidget):
         if existing is not None:
             existing.data = seg
             _apply_spatial_kwargs_to_layer(existing, skw)
+            _configure_binary_labels_layer(existing)
             self._apply_stored_labels_color(existing)
             self._result_layer = existing
             return existing
@@ -4167,12 +4192,11 @@ class RegionGrowWidget(QWidget):
             seg,
             name=layer_name,
             opacity=0.5,
-            colormap=_binary_segmentation_colormap(
-                self._layer_color(layer_name, DEFAULT_SEGMENTATION_COLOR)
-            ),
             **skw,
         )
-        _ensure_labels_show_selected(lyr)
+        _init_binary_labels_layer(
+            lyr, self._layer_color(layer_name, DEFAULT_SEGMENTATION_COLOR)
+        )
         self._result_layer = lyr
         return lyr
 
