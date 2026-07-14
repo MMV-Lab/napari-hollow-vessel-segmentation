@@ -37,6 +37,10 @@ Console scripts (also available after install):
 
 ## OME-Zarr and large volumes
 
+**Zarr** is a format for storing large N-dimensional arrays on disk (or cloud storage) as **chunked**, **compressed** files. Instead of loading an entire volume into RAM, napari and analysis tools read only the chunks they need — which is why it scales to whole-organ 3D datasets. A Zarr **store** is usually a directory of small binary files plus JSON metadata.
+
+**OME-Zarr** (Open Microscopy Environment Zarr) is a community convention for microscopy data built on Zarr. It follows the **NGFF** (Next-Generation File Format) spec: a **multiscale pyramid** of the same field of view at decreasing resolution (`0/` = finest, `1/`, `2/`, … = coarser), with **physical voxel spacing** and axis metadata in JSON. A typical project folder ends in **`.ome.zarr`**. This plugin reads and writes the **image pyramid** at the store root and stores segmentations as separate **labels** groups under **`labels/<name>/`**, each with its own pyramid — so masks stay aligned with the image without replacing the raw data.
+
 - **Preprocess before napari:** run contrast stretch (and optional downsample) on disk with **`regiongrow-preprocess-zarr`** or **`regiongrow-preprocess-ome-tiff`**, then open the output in napari. The napari widget does not include in-memory preprocessing.
 - **Which reader to pick:** this plugin’s **Read OME-Zarr image** reader opens only the raw image pyramid from `.ome.zarr` stores (no saved labels). An empty **Segmentation** layer is created in the widget for new work. To import a saved mask, use **Load saved segmentation from OME-Zarr…** under **Layers**. **[napari-ome-zarr](https://github.com/ome/napari-ome-zarr)** may also open the same stores (sometimes including `labels/` groups); pick the reader that matches your workflow.
 - This plugin also ships an **OME-TIFF** reader for `*.ome.tif` / `*.ome.tiff` (loads the first series; multi-channel/time stacks use index 0 and emit a warning).
@@ -56,15 +60,32 @@ regiongrow-preprocess-zarr volume.ome.zarr volume_stretched.ome.zarr --stretch -
 
 ## Step-by-step guide
 
+**Strategy: coarse level first, details later.** Sketch the vessel tree on a **coarse pyramid level** (fast, low RAM). When the layout is right, move to **finer levels** to refine diameter, small branches, and boundaries — or use **Post-processing → Upsample** after merging on a coarse grid.
+
+### Workflow checklist
+
+Use this as a quick orientation; see **Detailed steps** below for explanations.
+
+- [ ] **1. Setup** — Load a 3D image in napari (OME-Zarr or other). Open **Plugins → Region Grow Vessel Segmentation**.
+- [ ] **2. Coarse pyramid** — Under **Layers**, pick a **coarse Pyramid level** (not finest). You will segment the rough shape here first.
+- [ ] **3. Segmentation mask** — Select the **Image** layer. Choose or create a **Segmentation mask** (empty is fine for the first branch).
+- [ ] **4. (Optional) Blockers** — **New Blocker** or select a **Blocker mask** if growth leaks at organ edges.
+- [ ] **5. One branch** — Place branch points (in click order) → tune **Segmentation parameters** → **Compute Branch** → review/fix **Draft_Branch** → **Merge Branch**.
+- [ ] **6. More branches at this level?** — Reset or clear branch points → **repeat step 5**.
+- [ ] **7. Finer detail?** — Switch to a **finer Pyramid level** (or upsample / re-grow segments) → **repeat from step 2** (same mask resamples to the new grid when you change level).
+- [ ] **8. Export** — Under **Saving**, write labels to the `.ome.zarr` store when satisfied (autosave after **Merge** only updates `segmentation_autosave`).
+
+### Detailed steps
+
 1. Open napari and load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory.
 2. Open the widget: **Plugins → Region Grow Vessel Segmentation**.
 3. Select the image in **Layers → Image**. The plugin does **not** add an empty labels layer until your first **Grow** or **Merge** when no labels layer exists on that grid (then it creates **Segmentation Result**).
 4. Under **Segmentation**, use **Segmentation mask** to choose the labels layer that receives **Merge** and provides context for **Grow** (e.g. **Segmentation Result**). Use **New Mask** to add another empty labels layer on the grid. An **empty** mask is valid for the **first** segment: **Grow** ORs it with the growing preview.
 5. **New BranchPoints Layer** adds a new points layer (**BranchPoints_2**, …). **Reset branch points** clears the layer currently selected in **Branch points layer** (not only the default **BranchPoints** name). Optionally use **Blocker mask (optional)** / **New Blocker** to paint walls on the same pyramid grid as the image (whole-organ leakage).
-6. Add **at least two** points in **click order** along one vessel segment. Open **Segmentation parameters** for **Seed tube radius** and **Fill with** (**3D Active Contour** is the default; switch to Plain if needed). Defaults: MGAC **Corridor length margin** 0.15, tube radius 60, smoothing γ 0, 85 iterations; Plain **Length margin** 0. **Compute Branch** runs MGAC/Plain in a **local ROI** around the polyline (padding ≈ 2× tube radius in Z, 1.5× in XY, plus corridor margin). Writes to **Draft_Branch**; if that layer already held a preview and you did not reset or merge, the old mask is renamed to **Draft_Branch (1)**, **(2)**, … and a fresh preview layer is used. Hover the **Segmentation**, **Post-processing**, or **Saving** section titles for workflow notes.
+6. Add **at least two** points in **click order** along one vessel segment. **Branch point placement:** the polyline is only as faithful as the points you place — **higher tortuosity** (curves, bends, S-shapes) needs **more points** along the centerline so the corridor follows the vessel. For **long branches**, split the vessel into **several shorter grows** (reset points or use **New BranchPoints Layer** between segments) rather than one span from end to end; this helps especially when **diameter changes** a lot along the branch (tapering, bulges, junctions), because seed tube radius and corridor margin are uniform per grow. Open **Segmentation parameters** for **Seed tube radius** and **Fill with** (**3D Active Contour** is the default; switch to Plain if needed). Defaults: MGAC **Corridor length margin** 0.15, tube radius 60, smoothing γ 0, 85 iterations; Plain **Length margin** 0. **Compute Branch** runs MGAC/Plain in a **local ROI** around the polyline (padding ≈ 2× tube radius in Z, 1.5× in XY, plus corridor margin). Writes to **Draft_Branch**; if that layer already held a preview and you did not reset or merge, the old mask is renamed to **Draft_Branch (1)**, **(2)**, … and a fresh preview layer is used. Hover the **Segmentation**, **Post-processing**, or **Saving** section titles for workflow notes.
 7. When satisfied, **Merge Branch**. Clear or reset points, then repeat for the next segment. Merged masks are **autosaved in the background** to `labels/segmentation_autosave` when the source `.ome.zarr` path is known (~2.5 s after merge).
 8. **Reset branch preview** clears **Branch Segmentation** only. To clear a labels mask, edit or delete the layer in napari.
-9. For large volumes: pick a coarser **Pyramid level** under **Layers**. Run **`regiongrow-preprocess-zarr`** (or **`regiongrow-preprocess-ome-tiff`**) before opening napari if you need contrast stretch on disk (see example below). **Post-processing → Upsample** and morphology need a merged mask on the working grid; the plugin tracks the last layer you merged into (or **Segmentation Result** if present). Use **Saving** to export labels to OME-Zarr.
+9. When the coarse pass is complete, move to a **finer Pyramid level** and repeat branch placement and merging for detail, or use **Post-processing → Upsample** / morphology on the working grid. Run **`regiongrow-preprocess-zarr`** (or **`regiongrow-preprocess-ome-tiff`**) before opening napari if you need contrast stretch on disk (see example below). Use **Saving** to export labels to OME-Zarr.
 
 **Archiving:** the old **Run** path that renamed **Segmentation Result** to **Result_v*** before each run has been removed. Rename or duplicate layers in napari if you want snapshots.
 
@@ -126,6 +147,12 @@ After you have merged labels on the working grid:
 Export to OME-Zarr labels is under **Saving** (separate from upsample/morphology).
 
 ## Practical parameter tips
+
+### Branch point placement
+
+- **Tortuosity:** place more points along bends and curves — a two-point chord across a winding vessel leaves the polyline corridor far from the true centerline, so growth may miss the lumen or leak at corners.
+- **Long branches:** split into multiple shorter segments (grow → merge → new points → grow again) instead of one polyline from junction to tip. Each grow uses one **Seed tube radius** and corridor margin; a single long run struggles when **diameter changes** along the branch (narrow distal segments vs wide proximal segments, bulges, or side openings).
+- **Rule of thumb:** add a point wherever the vessel visibly deviates from a straight line between existing knots, and start a new branch when radius or wall contrast changes enough that one tube radius no longer fits the whole span.
 
 ### Plain mode (parameters under **Segmentation → Plain parameters**)
 
