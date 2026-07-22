@@ -1,54 +1,86 @@
-# Region Grow - 3D Vessel Segmentation for napari
+# Region Grow — 3D vessel segmentation for napari
 
-A [napari](https://napari.org) plugin for interactive segmentation of hollow
-vessels in 3D fluorescence microscopy.
+Interactive **semi-automatic** segmentation of **hollow vessels** in 3D fluorescence microscopy. You place ordered points along a branch; the plugin grows a 3D mask along that path and you **merge** it into a master labels layer, branch by branch.
 
-The plugin uses one workflow for every vessel segment (main trunk or side branch):
+**Default fill method:** **3D Active Contour (MGAC)**. Alternative: **Plain region growing**.
 
-- **3D active contour (MGAC)** (default) or **plain region growing** along a user-drawn **polyline** (two or more ordered points in a points layer).
-- Each **Grow** writes a preview to **Branch Segmentation**; **Merge** unions that preview into the selected **Segmentation mask** labels layer (often **Segmentation Result**). That mask may be **empty** for the first segment—no separate seed labels layer or two-point-only “start/end” layer.
-- Optional **Blocker mask** (labels on the image grid): painted foreground blocks **both** MGAC and Plain growth — useful on whole-organ scans to stop leakage where vessels meet the organ boundary. Use **New Blocker** or choose any matching labels layer in **Blocker mask (optional)**. Optional **Upsample** / **morphology** run after you have a mask on the working grid (merge at least once so the plugin tracks a labels layer for post-processing).
+---
+
+## At a glance
+
+| Concept | In the UI / layers |
+|--------|---------------------|
+| Master mask (merge target) | **Segmentation mask** → layer **`Segmentation`**, **`Segmentation_1`**, … |
+| Branch markers | **Branch points layer** → **`BranchPoints`**, **`BranchPoints_1`**, … |
+| Per-branch preview | **`Draft_Branch`** (live); archives **`Draft_Branch (1)`**, **`(2)`**, … |
+| Optional walls | **Blocker_Mask (optional)** → **`Blocker_Mask`**, … |
+| Run growth | **Compute Branch** |
+| Commit preview | **Merge Branch** |
+| Clear preview only | **Reset Branch** |
+
+**Strategy:** work on a **coarse pyramid level** first (fast, low RAM), then move to **finer levels** for detail. See [Workflow checklist](#workflow-checklist).
+
+---
 
 ## What this is for
 
-- Hollow vessels with bright walls, darker lumen, and darker background
-- Surfaces with folds/wrinkles where simple thresholding leaks
-- Users who want interactive seed-and-run segmentation in napari
+- Bright vessel walls, darker lumen, darker background  
+- Folds and wrinkles where global thresholding leaks  
+- Large volumes (OME-Zarr pyramids) where you need **human guidance**, not fully automatic whole-organ segmentation  
+
+---
 
 ## Install
 
-Requires **Python ≥ 3.11** and a working **napari** with a Qt backend (e.g. `pip install "napari[all]"`). One install provides the napari plugin, OME-Zarr I/O, preprocessing CLIs, and image → OME-Zarr conversion (OME-TIFF, TIFF, PNG, JPEG, and other [BioIO reader plugins](https://bioio-devs.github.io/bioio/OVERVIEW.html)):
+**Python ≥ 3.11**, napari with a Qt backend (e.g. `pip install "napari[all]"`).
 
 ```bash
 pip install -e .
 ```
 
-For development with tests:
+Development / tests:
 
 ```bash
 pip install -e ".[test]"
 ```
 
-Console scripts (also available after install):
+**Console scripts**
 
-- `regiongrow-convert-to-ome-zarr` — any BioIO-readable image → multiscale OME-Zarr
-- `regiongrow-preprocess-zarr` — contrast stretch / downsample on OME-Zarr
-- `regiongrow-preprocess-ome-tiff` — contrast stretch / downsample on OME-TIFF
+| Command | Purpose |
+|---------|---------|
+| `regiongrow-convert-to-ome-zarr` | BioIO-readable image → multiscale `.ome.zarr` |
+| `regiongrow-preprocess-zarr` | Contrast stretch / downsample on OME-Zarr |
+| `regiongrow-preprocess-ome-tiff` | Contrast stretch / downsample on OME-TIFF |
 
-## OME-Zarr and large volumes
+Open the dock: **Plugins → Region Grow Vessel Segmentation**.
 
-**Zarr** is a format for storing large N-dimensional arrays on disk (or cloud storage) as **chunked**, **compressed** files. Instead of loading an entire volume into RAM, napari and analysis tools read only the chunks they need — which is why it scales to whole-organ 3D datasets. A Zarr **store** is usually a directory of small binary files plus JSON metadata.
+---
 
-**OME-Zarr** (Open Microscopy Environment Zarr) is a community convention for microscopy data built on Zarr. It follows the **NGFF** (Next-Generation File Format) spec: a **multiscale pyramid** of the same field of view at decreasing resolution (`0/` = finest, `1/`, `2/`, … = coarser), with **physical voxel spacing** and axis metadata in JSON. A typical project folder ends in **`.ome.zarr`**. This plugin reads and writes the **image pyramid** at the store root and stores segmentations as separate **labels** groups under **`labels/<name>/`**, each with its own pyramid — so masks stay aligned with the image without replacing the raw data.
+## Data formats
 
-- **Preprocess before napari:** run contrast stretch (and optional downsample) on disk with **`regiongrow-preprocess-zarr`** or **`regiongrow-preprocess-ome-tiff`**, then open the output in napari. The napari widget does not include in-memory preprocessing.
-- **Which reader to pick:** this plugin’s **Read OME-Zarr image** reader opens only the raw image pyramid from `.ome.zarr` stores (no saved labels). An empty **Segmentation** layer is created in the widget for new work. To import a saved mask, use **Load saved segmentation from OME-Zarr…** under **Layers**. **[napari-ome-zarr](https://github.com/ome/napari-ome-zarr)** may also open the same stores (sometimes including `labels/` groups); pick the reader that matches your workflow.
-- This plugin also ships an **OME-TIFF** reader for `*.ome.tif` / `*.ome.tiff` (loads the first series; multi-channel/time stacks use index 0 and emit a warning).
-- **RAM vs chunks:** Zarr chunking helps on disk and in napari’s viewer. **Compute Branch** can crop to a polyline ROI (on by default under **Layers**) and optionally cache the pyramid level in session RAM. Grow uses float32. Uncheck ROI to process the full level (slower). If the region is still too large, use a coarser pyramid level or run **`regiongrow-preprocess-zarr`** first.
-- Under **Layers**, use **Pyramid level** when the image is multiscale. **Enable multiscale rendering in 2D** (on by default) lets napari switch pyramid levels as you zoom; turn it off to lock the canvas to the selected level (zoom without loading finer data). **Adapt Z step to pyramid level** (on by default) widens the napari Z slider step on coarse levels so each keypress shows a new slice instead of identical subsampled planes (2D with multiscale off, or 3D). **Post-processing → Upsample** zooms a mask to the **finest** resolution when the working grid is coarser than finest (e.g. after **Grow** on a pyramid level).
-- **OME-Zarr labels layout:** the raw image pyramid lives at the store root (`0/`, `1/`, …). Segmentations are separate NGFF **labels** groups under **`labels/<name>/`** — each group has its own pyramid arrays (`labels/segmentation/0`, `labels/segmentation/1`, …) and metadata. The store root lists label names in **`labels`** (zarr attrs). This plugin uses **`segmentation`** (first manual save), **`segmentation_v2`**, … (each manual **New version** save), and **`segmentation_autosave`** (overwrite checkpoint after **Merge**). Pick the **`.ome.zarr` root** in load/save dialogs — not a folder inside `labels/`.
-- **Saving segmentation:** under the separate **Saving** section, **Save target** = **New version** (default, always creates the next `segmentation_vN`), **Overwrite autosave**, or **Overwrite existing version…** (pick a group). **Save resolution** = working pyramid level or full finest. **Autosave** after **Merge** only touches `segmentation_autosave`.
-- **Load saved segmentation…** (under **Layers**) asks which group to load when you select the **`.ome.zarr` root** or **`labels/`**; select **`labels/<name>/`** directly to load that group without the picker. Loading runs in the background and resamples large finest-resolution saves down to your current pyramid level without loading the full volume into RAM.
+### Zarr and OME-Zarr (recommended for large volumes)
+
+**Zarr** stores arrays as **chunked**, **compressed** files on disk. Viewers read **regions**, not necessarily the full volume — important for whole-organ datasets.
+
+**OME-Zarr** is a microscopy convention (NGFF): a **multiscale pyramid** of the same field of view (`0/` = finest, `1/`, `2/`, … = coarser), plus **voxel spacing** in metadata. Project folders usually end in **`.ome.zarr`**.
+
+This plugin:
+
+- Opens the **image pyramid** at the store root (reader: **Read OME-Zarr image**).  
+- Writes segmentations under **`labels/<name>/`** (separate label pyramids; raw image unchanged).  
+- **Autosave after Merge** (when the image path is known): overwrites **`labels/segmentation_autosave`**.  
+- Manual **Saving**: **`segmentation`**, then **`segmentation_v2`**, … for **New version**.
+
+Pick the **`.ome.zarr` root** in dialogs — not a subfolder inside `labels/` unless you intentionally load one group.
+
+**Preprocess on disk** (contrast stretch, optional downsample) with the CLI tools above; the dock widget does not preprocess in memory.
+
+**Other readers shipped with the plugin**
+
+- **OME-TIFF** (`*.ome.tif` / `*.ome.tiff`) — first series; multi-channel/time uses index 0 with a warning.  
+- **Load saved segmentation from OME-Zarr…** (under **Layers**) — imports an existing labels group; resamples to your current **Pyramid level** without loading full finest into RAM when possible.
+
+**napari-ome-zarr** can also open the same stores; choose the reader that fits your workflow.
 
 ### Example CLI
 
@@ -58,143 +90,244 @@ regiongrow-convert-to-ome-zarr stack.tif -o stack.ome.zarr --voxel-size 2.0,0.65
 regiongrow-preprocess-zarr volume.ome.zarr volume_stretched.ome.zarr --stretch --no-downsample
 ```
 
-## Step-by-step guide
+---
 
-**Strategy: coarse level first, details later.** Sketch the vessel tree on a **coarse pyramid level** (fast, low RAM). When the layout is right, move to **finer levels** to refine diameter, small branches, and boundaries — or use **Post-processing → Upsample** after merging on a coarse grid.
+## Workflow checklist
 
-### Workflow checklist
+**Coarse first, detail later:** sketch the vessel tree on a **coarse Pyramid level**, then refine on finer levels or re-grow segments.
 
-Use this as a quick orientation; see **Detailed steps** below for explanations.
+- [ ] **1. Setup** — Load a 3D volume in napari. Open **Region Grow Vessel Segmentation**.
+- [ ] **2. Coarse level** — **Layers → Pyramid level** → choose a **coarse** level (not finest).
+- [ ] **3. Image & mask** — Select **Image**. Choose or create **Segmentation mask** (empty is OK for the first branch).
+- [ ] **4. (Optional) Blockers** — **New Blocker** if growth leaks at organ boundaries.
+- [ ] **5. One branch** — Add branch points (click order) → **Compute Branch** → edit **`Draft_Branch`** if needed → **Merge Branch**.
+- [ ] **6. More branches?** — **Reset branch points** (or new points layer) → **repeat step 5**.
+- [ ] **7. Finer detail?** — Finer **Pyramid level** (mask resamples when you change level) → **repeat from step 2**.
+- [ ] **8. Export** — **Saving → Save segmentation** (plus optional post-processing below).
 
-- [ ] **1. Setup** — Load a 3D image in napari (OME-Zarr or other). Open **Plugins → Region Grow Vessel Segmentation**.
-- [ ] **2. Coarse pyramid** — Under **Layers**, pick a **coarse Pyramid level** (not finest). You will segment the rough shape here first.
-- [ ] **3. Segmentation mask** — Select the **Image** layer. Choose or create a **Segmentation mask** (empty is fine for the first branch).
-- [ ] **4. (Optional) Blockers** — **New Blocker** or select a **Blocker mask** if growth leaks at organ edges.
-- [ ] **5. One branch** — Place branch points (in click order) → tune **Segmentation parameters** → **Compute Branch** → review/fix **Draft_Branch** → **Merge Branch**.
-- [ ] **6. More branches at this level?** — Reset or clear branch points → **repeat step 5**.
-- [ ] **7. Finer detail?** — Switch to a **finer Pyramid level** (or upsample / re-grow segments) → **repeat from step 2** (same mask resamples to the new grid when you change level).
-- [ ] **8. Export** — Under **Saving**, write labels to the `.ome.zarr` store when satisfied (autosave after **Merge** only updates `segmentation_autosave`).
+---
 
-### Detailed steps
+## Step-by-step (detailed)
 
-1. Open napari and load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory.
-2. Open the widget: **Plugins → Region Grow Vessel Segmentation**.
-3. Select the image in **Layers → Image**. The plugin does **not** add an empty labels layer until your first **Grow** or **Merge** when no labels layer exists on that grid (then it creates **Segmentation Result**).
-4. Under **Segmentation**, use **Segmentation mask** to choose the labels layer that receives **Merge** and provides context for **Grow** (e.g. **Segmentation Result**). Use **New Mask** to add another empty labels layer on the grid. An **empty** mask is valid for the **first** segment: **Grow** ORs it with the growing preview.
-5. **New BranchPoints Layer** adds a new points layer (**BranchPoints_2**, …). **Reset branch points** clears the layer currently selected in **Branch points layer** (not only the default **BranchPoints** name). Optionally use **Blocker mask (optional)** / **New Blocker** to paint walls on the same pyramid grid as the image (whole-organ leakage).
-6. Add **at least two** points in **click order** along one vessel segment. **Branch point placement:** the polyline is only as faithful as the points you place — **higher tortuosity** (curves, bends, S-shapes) needs **more points** along the centerline so the corridor follows the vessel. For **long branches**, split the vessel into **several shorter grows** (reset points or use **New BranchPoints Layer** between segments) rather than one span from end to end; this helps especially when **diameter changes** a lot along the branch (tapering, bulges, junctions), because seed tube radius and corridor margin are uniform per grow. Open **Segmentation parameters** for **Seed tube radius** and **Fill with** (**3D Active Contour** is the default; switch to Plain if needed). Defaults: MGAC **Corridor length margin** 0.15, tube radius 60, smoothing γ 0, 85 iterations; Plain **Length margin** 0. **Compute Branch** runs MGAC/Plain in a **local ROI** around the polyline (padding ≈ 2× tube radius in Z, 1.5× in XY, plus corridor margin). Writes to **Draft_Branch**; if that layer already held a preview and you did not reset or merge, the old mask is renamed to **Draft_Branch (1)**, **(2)**, … and a fresh preview layer is used. Hover the **Segmentation**, **Post-processing**, or **Saving** section titles for workflow notes.
-7. When satisfied, **Merge Branch**. Clear or reset points, then repeat for the next segment. Merged masks are **autosaved in the background** to `labels/segmentation_autosave` when the source `.ome.zarr` path is known (~2.5 s after merge).
-8. **Reset branch preview** clears **Branch Segmentation** only. To clear a labels mask, edit or delete the layer in napari.
-9. When the coarse pass is complete, move to a **finer Pyramid level** and repeat branch placement and merging for detail, or use **Post-processing → Upsample** / morphology on the working grid. Run **`regiongrow-preprocess-zarr`** (or **`regiongrow-preprocess-ome-tiff`**) before opening napari if you need contrast stretch on disk (see example below). Use **Saving** to export labels to OME-Zarr.
+1. **Load data** — Single-channel 3D stack (Z×Y×X). For OME-Zarr, open the `.ome.zarr` directory (plugin or napari-ome-zarr reader).
 
-**Archiving:** the old **Run** path that renamed **Segmentation Result** to **Result_v*** before each run has been removed. Rename or duplicate layers in napari if you want snapshots.
+2. **Open the plugin** — **Plugins → Region Grow Vessel Segmentation**.
 
-### GIF capture (growth animation)
+3. **Layers section**  
+   - **Image** — volume to segment.  
+   - **Pyramid level** — resolution used for grow, masks, and points (level **0** = finest).  
+   - **Enable multiscale rendering in 2D** — **off by default**; when off, the canvas stays on the selected level while you zoom (good for layout on coarse levels). When on, napari swaps pyramid levels while zooming.  
+   - **Adapt Z step to pyramid level** — **on by default** on coarse levels (sensible Z slider steps).  
+   - **Crop Compute Branch to polyline ROI** — **on by default**; loads only a box around the branch (faster, less RAM).  
+   - **Cache pyramid level in session** — **on by default**; caches the working level in RAM after first read (float32).  
+   - **Load saved segmentation from OME-Zarr…** — import a labels group from disk.
 
-Under **Visualization**, enable **Capture animation (GIF)** to record the viewer during each **Grow**. By default, **Skeletal Preview** (the polyline tube before propagation) stays **hidden** in the layer list; show it in napari if you want that overlay.
+4. **Segmentation section**  
+   - **Segmentation mask** — labels layer that receives **Merge Branch** and supplies context during grow. Selecting an image creates **`Segmentation`** when no suitable mask exists on the current grid. **New Mask** adds **`Segmentation_1`**, etc.  
+   - **Branch points layer** — all points in **data order** form one polyline (≥2 points). **New BranchPoints Layer** / **Reset branch points**.  
+   - **Branch preview (merge from)** — usually live **`Draft_Branch`**; can merge an archived **`Draft_Branch (N)`**.  
+   - **Blocker_Mask (optional)** — painted foreground blocks Plain and MGAC.  
+   - **Seed tube radius** — see [Default parameters](#default-parameters).  
+   - **Fill with** — **3D Active Contour** (default) or **Plain Region Growing**.  
+   - **Compute Branch** — writes to **`Draft_Branch`** (archives non-empty live preview to **`Draft_Branch (1)`**, … if you start again without merge/reset).  
+   - **Reset Branch** — clears **`Draft_Branch`** data; keeps branch points.  
+   - **Merge Branch** — unions selected preview into **Segmentation mask**. Optional **CleanUp** (**on by default**): removes archived drafts and extra branch-point layers; keeps one empty **`Draft_Branch`** and **`BranchPoints`**.  
+   - **Stop** — aborts a running grow.
 
-**One GIF per Grow:** leave **Combine branch grows in one GIF** unchecked. After a successful grow you are prompted for a save path; encoding runs in the background.
+5. **Branch point placement**  
+   - **Tortuosity:** more bends → **more points** along the centerline.  
+   - **Long branches / changing diameter:** split into several grows (merge between segments); one grow uses one tube radius and one corridor margin.
 
-**One GIF for several branches:** check **Combine branch grows in one GIF (commit on Merge)**. Each grow is still recorded, but frames are appended to the combined clip only when you click **Merge**. **Reset branch preview** discards the last grow’s recording without merging. Starting a new **Grow** clears any unmerged recording from the previous attempt. When finished, use **Save combined GIF…** (encoding clears the in-memory combined buffer after a successful save).
+6. **After merge** — Autosave to **`segmentation_autosave`** ~2.5 s later if the `.ome.zarr` path is known. Reset points and repeat for the next branch.
 
-Playback length follows the number of captured frames and **GIF playback FPS**. **Frame subsample (N)** keeps every *N*-th displayed step (use with **Animate growth** and the Plain / MGAC step controls). **Max frames** caps frames per grow segment. **Capture region** is viewer canvas or full napari window; **Frame scale** shrinks frames before encoding. **GIF canvas width / height** control the pixel size of every frame in the saved GIF (letterboxing): leave both at **Auto** to use the largest width and height seen in that save (enough for a single grow); for **combined GIFs**, set both to the same fixed size (e.g. 960×720) so segments from different window layouts still stack. If **Animate growth** is off but capture is on, the plugin still uses the same step intervals as when animation is on so the recording is usable.
+7. **Finer resolution** — Change **Pyramid level** and continue growing, or use **Post-processing** (below).
 
-## Technical notes (short)
+---
 
-1. **Coordinates:** Points use `data_to_world` on the points layer and `world_to_data` on the image layer so grids match after contrast-stretched images or layer translation.
-2. **Branch seed:** `skimage.draw.line_nd` (or a fallback) rasterizes segment between consecutive knots; `scipy.ndimage.distance_transform_edt` builds the same style of tube as main MGAC. **Branch MGAC** clips evolution with a **polyline corridor** (EDT envelope around the full centerline), not only the straight segment between first and last point, so curved branches are not eroded to an empty mask. The morphological **edge shrink** step would otherwise delete a thin polyline tube in a handful of iterations; branch runs therefore use a **balloon-first warmup** (inflate along the edge image with a low speed threshold, no shrink term), then the full MGAC loop.
-3. **MGAC smoothing γ (steps):** skimage morphological curvature (`_curvop`) runs **after balloon+edge in every MGAC iteration**, not once at the end. Values ``> 0`` regularize but **thin** narrow masks each iteration; the UI default is **0** (tune upward per dataset). After each MGAC chunk a **binary closing** (one iteration, physical ball) fills typical **1-voxel stripe / checkerboard** gaps from the discrete edge update.
-4. **Blockers:** Choose a labels layer (or **none**) in **Blocker mask (optional)**. Foreground voxels block **Plain** priority-queue growth (non-traversable). For **MGAC**, they zero the edge speed map, are cleared from the level set each iteration, and are stripped from the initial seed before the first displayed frame.
-5. **Grow ROI:** When **Crop Compute Branch to polyline ROI** is checked (default), only a bounding box around the polyline is loaded (padding ≈ **2×** seed tube radius in **Z**, **1.5×** in **XY**, plus corridor margin and MGAC σ halo). Optional **Cache pyramid level in session** stores each level in RAM after the first full read (float32).
+## Dock sections (quick lookup)
 
-## Method overview
+| Section | Main actions |
+|---------|----------------|
+| **Layers** | Image, pyramid level, ROI crop, cache, load saved labels |
+| **Visualization** | Animate growth, GIF capture, layer color, Plain/MGAC step display rates |
+| **Segmentation** | Mask, points, blockers, parameters, Compute / Reset / Merge |
+| **Post-processing** | Upsample, morphology (after merge) |
+| **Saving** | Export labels to OME-Zarr |
+
+Hover **Segmentation**, **Post-processing**, and **Saving** section headers for short in-app notes.
+
+---
+
+## Post-processing
+
+Requires a mask on the **working pyramid grid** — **Merge Branch** at least once so the plugin tracks a segmentation layer.
+
+| Control | Effect |
+|---------|--------|
+| **Upsample Result to Original Size** | Nearest-neighbour zoom to finest grid when metadata says working shape ≠ finest (legacy **Grow**-on-coarse workflow). |
+| **Upsample segmentation to finer level…** | New editable labels layer on the **next finer** pyramid level. |
+| **Operation / Ball radius / Apply Morphological Operation** | 3D dilation or erosion; creates a new result layer (default operation **None**, radius **1**). |
+
+**Saving** is separate: writes the selected **Segmentation mask** to **`labels/…`** in the OME-Zarr store.
+
+**Save resolution (default: Working pyramid level)** — keeps mask on current grid + matching coarser label levels; lowest RAM. **Full finest resolution** — chunked upsample on write (disk can be very large).
+
+**Save target (default: New version)** — `segmentation_vN`, overwrite **`segmentation_autosave`**, overwrite loaded group, or choose another store.
+
+---
+
+## Default parameters
+
+Values below are **widget defaults** at startup (finest-isotropic units for tube radius where noted).
+
+### Layers / grow
+
+| Setting | Default |
+|---------|---------|
+| Crop Compute Branch to polyline ROI | On |
+| Cache pyramid level in session | On |
+| Enable multiscale rendering in 2D | Off |
+| Adapt Z step to pyramid level | On |
+| Animate growth | Off |
+| Merge → CleanUp | On |
+
+### Segmentation (shared)
+
+| Setting | Default |
+|---------|---------|
+| Fill with | 3D Active Contour |
+| Seed tube radius | **40** (× min finest spacing → physical radius; scales to working level) |
+
+### Plain Region Growing (branch)
+
+| Setting | Default |
+|---------|---------|
+| Smoothing σ | 2.0 |
+| Flux penalty | 15.0 |
+| Intensity tolerance | 3.0 |
+| Cost budget | 0 (= auto) |
+| Length margin | 0.0 |
+| Upper threshold | Off |
+
+### 3D Active Contour / MGAC (branch)
+
+| Setting | Default |
+|---------|---------|
+| Corridor length margin | 0.15 |
+| Edge σ (physical) | 3.0 |
+| Low clip | 0.0 |
+| Balloon | 0.1 |
+| Smoothing γ (steps) | 0 |
+| Total iterations | **40** |
+| Early stop (unchanged steps) | **2** (0 = run all iterations) |
+
+### Visualization (when enabled)
+
+| Setting | Default |
+|---------|---------|
+| Plain: refresh every N steps | 500 |
+| MGAC: refresh every N iterations | 5 |
+| GIF capture | Off |
+| Combine branch grows in one GIF | Off |
+
+---
+
+## Algorithms
 
 ### Plain region growing
 
-The plain mode is a min-heap front propagation method with multiple stopping
-criteria:
+Priority-queue (Dijkstra-style) expansion on an **edge-weighted** cost map, with:
 
-1. Edge-weighted local cost.
-   Local cost is derived from an edge indicator based on image gradients, so crossing strong edges becomes expensive.
-2. Priority-queue expansion.
-   Voxels are accepted in increasing accumulated cost order (Dijkstra-style, cheapest-first).
-3. Flux penalty.
-   Outward gradient flux is used as a soft penalty to discourage wall-to-background leakage while tolerating local wall roughness.
-4. Adaptive intensity gate.
-   Running region statistics reject candidates that fall too far below the current region intensity model.
-5. Length constraint.
-   Growth is clipped along the vessel axis implied by the polyline (chord-based margin), plus a margin.
+1. **Gradient-based edge cost** — crossing strong edges is expensive.  
+2. **Flux penalty** — discourages leaking outward through walls.  
+3. **Adaptive intensity gate** — running statistics reject outliers.  
+4. **Length constraint** — growth limited along the polyline axis (chord + margin).
 
 ### 3D active contour (MGAC)
 
-The active contour mode initializes a tube around the seed centerline and
-evolves it with Morphological Geodesic Active Contours on an inverse-gradient
-edge image. A balloon force controls outward/inward bias. **Smoothing steps**
-apply skimage morphological curvature **once per outer iteration** (after
-balloon and edge updates), not as a final post-process—non-zero smoothing tends
-to thin narrow tubes over many iterations. The length constraint clips extent
-(polyline **corridor** for MGAC; plain mode uses the same polyline for statistics and axis margin).
+1. **Seed tube** — polyline rasterized between consecutive points; distance transform builds a tube (same idea as seed for Plain).  
+2. **Polyline corridor** — MGAC is clipped to an envelope around the **full** polyline (not just the straight line from first to last point), so curved branches are not eroded away.  
+3. **Balloon-first warmup** — short inflate phase so thin tubes survive early morphological shrink.  
+4. **MGAC loop** — morphological geodesic active contours on an inverse-gradient edge image; balloon force; optional **smoothing γ** each iteration (default **0**; higher values thin narrow tubes).  
+5. **Post-chunk closing** — binary closing fills typical 1-voxel stripe artifacts from discrete updates.
 
-### Shared post-processing
+### Blockers
 
-After you have merged labels on the working grid:
+Foreground in **Blocker_Mask** is non-traversable for Plain and zeros MGAC edge speed; mask voxels are cleared from the contour each iteration.
 
-- Upsampling restores full resolution when the working grid is coarser than the finest image (e.g. **Grow** on a pyramid level).
-- Morphological Dilation/Erosion (ball radius in voxels) refines mask shape.
-- In anisotropic datasets, a common correction is one Erosion with radius 1
-   to remove slight extra thickness along Z while preserving XY quality.
+### Coordinates
 
-Export to OME-Zarr labels is under **Saving** (separate from upsample/morphology).
+Branch points use the points layer transform; growth uses the image grid at the selected **Pyramid level** (`world_to_data` / spacing-aware tube radius).
 
-## Practical parameter tips
+---
 
-### Branch point placement
+## Branch point tips
 
-- **Tortuosity:** place more points along bends and curves — a two-point chord across a winding vessel leaves the polyline corridor far from the true centerline, so growth may miss the lumen or leak at corners.
-- **Long branches:** split into multiple shorter segments (grow → merge → new points → grow again) instead of one polyline from junction to tip. Each grow uses one **Seed tube radius** and corridor margin; a single long run struggles when **diameter changes** along the branch (narrow distal segments vs wide proximal segments, bulges, or side openings).
-- **Rule of thumb:** add a point wherever the vessel visibly deviates from a straight line between existing knots, and start a new branch when radius or wall contrast changes enough that one tube radius no longer fits the whole span.
+- Add a point wherever the vessel **deviates** from a straight line between existing points.  
+- **Split** long or tapering branches into multiple **Compute Branch → Merge** cycles.  
+- Use **Blocker_Mask** on whole-organ data where vessels meet the organ surface.
 
-### Plain mode (parameters under **Segmentation → Plain parameters**)
+---
 
-- Use **Blocker mask** if plain growth leaks outside the organ (same optional layer as MGAC).
-- Smoothing sigma: start at 2.0; increase for noisy images.
-- Flux penalty: increase if leakage occurs; decrease if growth stalls too early.
-- Intensity tolerance: increase if true vessel voxels are being rejected.
-- Cost budget: keep auto first; increase only when growth stops prematurely.
+## Parameter tuning (beyond defaults)
 
-### Active contour mode (MGAC in **Segmentation parameters**) — default fill method
+### Plain
 
-- Optional **Blocker mask** (same grid / pyramid level as the image): painted voxels block MGAC (see **Segmentation → Blocker mask**).
-- **Seed tube radius**: default **60** voxels (finest-isotropic); reduce for very thin vessels.
-- **Smoothing γ (steps):** default **0**; increase for stronger per-iteration smoothing (also thins narrow tubes).
-- **Total iterations:** default **85**. **Early stop** (MGAC parameters slider): stop after *N* consecutive display updates with an unchanged mask; **0** = run all iterations. Default **2**; increase if growth stops too soon.
-- Sigma is a **physical** Gaussian scale (same units as voxel spacing). The UI default **10** suits typical finest-resolution µm spacing; lower it (≈1.5–3.0) for small physical voxels or coarse pyramid levels where 10 over-smooths.
-- Balloon: 0.1 to 0.3 for thin vessels or strong edges; 0.5 to 1.0 for weak edges or smoother interiors.
+- Increase **σ** or **flux** if leakage; decrease flux if growth stops early.  
+- Increase **intensity tolerance** if true lumen voxels are rejected.  
+- Increase **cost budget** only when growth stops prematurely (0 = auto).
 
-### Morphological post-processing
+### MGAC
 
-- Dilation (radius 1 to 2) can fill tiny gaps or connect close fragments.
-- Erosion (radius 1 to 2) can remove thin protrusions or boundary noise.
-- For anisotropic voxel spacing, start with Erosion radius 1 to clean mild
-   Z-direction over-segmentation (often one-voxel too thick in Z).
-- Use larger radii cautiously because topology changes quickly in 3D.
+- Decrease **Seed tube radius** for very thin vessels.  
+- **σ** is physical (µm-scale); lower on coarse pyramid levels if edges blur.  
+- **Balloon** ~0.1–0.3 for strong edges; higher for weak edges.  
+- **Smoothing γ** > 0 thins masks each iteration — use sparingly.  
+- Raise **early stop** if the preview stabilizes too soon; set to **0** to force all iterations.
+
+### Morphology
+
+- **Erosion** radius 1 often removes one-voxel **Z** over-thickness in anisotropic data.  
+- Large 3D radii change topology quickly.
+
+---
+
+## GIF capture
+
+Under **Visualization**, enable **Capture animation (GIF)**.
+
+- **One GIF per grow** — leave **Combine branch grows in one GIF** unchecked; save path after each successful **Compute Branch**.  
+- **Combined GIF** — enable combine mode; frames append on **Merge Branch** only; **Reset Branch** drops unmerged recording; **Save combined GIF…** when done.
+
+**Skeletal Preview** (polyline tube before propagation) is hidden by default; toggle visibility in napari if needed.
+
+Subsampling, max frames, scale, and canvas size control file size (capture is RAM-capped ~1.5 GB).
+
+---
 
 ## Troubleshooting
 
-- **"seed_mask is empty (no seed voxels to grow from)":** the seed tube did not cover any voxel — increase **Seed tube radius**, check the polyline lies on the vessel, or confirm a **Blocker mask** is not covering the seed.
-- **"start_point and end_point coincide…":** place at least two distinct branch points (a double-click on the same spot produces a zero-length axis).
-- **"image contains NaN/Inf…":** the working pyramid level has non-finite values; reload, pick another level, or re-run contrast stretch on disk with `regiongrow-preprocess-zarr`.
-- **"… does not match any image pyramid level":** the mask grid differs from every image level. Pick the matching **Pyramid level** under **Layers**, or save at **finest** resolution.
-- **"… is not an .ome.zarr store" / "store not found":** select the store **root** (`mydata.ome.zarr`) in save/load dialogs, not a folder inside `labels/`. The saver never creates a new store.
-- **Out-of-memory on Grow:** enable the **ROI** crop (default), use a **coarser pyramid level**, or preprocess/downsample on disk first. Grow refuses to start past the RAM budget and tells you the estimate.
-- **GIF capture stops mid-grow:** capture is RAM-capped (~1.5 GB of frames); reduce **capture scale** or increase **subsample** to cover the whole grow.
+| Message / issue | What to try |
+|-----------------|-------------|
+| **seed_mask is empty** | Increase **Seed tube radius**; check points sit on the vessel; check blockers do not cover the seed. |
+| **start_point and end_point coincide** | ≥2 distinct points; avoid double-click duplicates. |
+| **NaN/Inf in image** | Reload; another pyramid level; preprocess with `regiongrow-preprocess-zarr`. |
+| **does not match any image pyramid level** (save) | Match **Pyramid level** to mask grid, or save at **Full finest resolution**. |
+| **not an .ome.zarr store** | Select store **root** (`name.ome.zarr`), not an arbitrary subfolder. |
+| **Out-of-memory on grow** | Keep **ROI crop** on; coarser **Pyramid level**; preprocess/downsample on disk. |
+| **Eraser / paint on mask** | Use napari labels **paint** or **erase** on **Segmentation** / **Draft_Branch**; plugin keeps masks editable (3D paint if `n_edit_dimensions` = 3). |
+| **GIF stops mid-grow** | Lower frame scale or increase subsample. |
+
+---
 
 ## References
 
-1. Dijkstra EW. A note on two problems in connexion with graphs. Numerische Mathematik. 1959;1:269-271.
-2. Vasilevskiy A, Siddiqi K. Flux maximizing geometric flows. IEEE Trans Pattern Anal Mach Intell. 2002;24(12):1565-1578.
-3. Marquez-Neila P, Baumela L, Alvarez L. A morphological approach to curvature-based evolution of curves and surfaces. IEEE Trans Pattern Anal Mach Intell. 2014;36(1):2-17.
-4. Welford BP. Note on a method for calculating corrected sums of squares and products. Technometrics. 1962;4(3):419-420.
+1. Dijkstra EW. A note on two problems in connexion with graphs. *Numerische Mathematik* 1959;1:269–271.  
+2. Vasilevskiy A, Siddiqi K. Flux maximizing geometric flows. *IEEE TPAMI* 2002;24(12):1565–1578.  
+3. Marquez-Neila P, Baumela L, Alvarez L. A morphological approach to curvature-based evolution of curves and surfaces. *IEEE TPAMI* 2014;36(1):2–17.  
+4. Welford BP. Note on a method for calculating corrected sums of squares and products. *Technometrics* 1962;4(3):419–420.
+
+---
 
 ## License
 
