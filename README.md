@@ -183,20 +183,18 @@ These controls live under **Layers** in the plugin dock. They govern **how much 
 
 **Coarse first, detail later:** sketch the vessel tree on a **coarse Pyramid level**. Move to finer levels when you want more detail or before final export — **upsampling is optional**, not a required step between every stage.
 
-**1. Setup** — Open **Plugins → Region Grow Vessel Segmentation**, then load a 3D volume in napari (OME-Zarr or other).
-**2. Coarse level** — **Layers → Pyramid level** → choose a **coarse** level (not finest).
-**3. Image & mask** — Select **Image**. Choose or create **Segmentation mask** (empty is OK for the first branch).
-**4. (Optional) Blockers** — **New Blocker** if growth leaks at organ boundaries.
-**5. One branch** — Add branch points (click order) → **Compute Branch** → edit **`Draft_Branch`** if needed → **Merge Branch**.
-**6. More branches at this level?** — **Reset branch points** and **repeat step 5**. With **CleanUp** checked (default), **Merge Branch** already clears archived **`Draft_Branch (N)`** layers and extra **`BranchPoints_*`** layers — you usually just place the next polyline.
-**7. Finer detail (optional)** — Switch to a **finer Pyramid level** and grow more branches, and/or use **optional Post-processing** upsampling or morphology if you need a finer grid or cleaner boundaries.
-**8. Export** — **Saving → Save segmentation** when satisfied.
+1. **Setup** — Open **Plugins → Region Grow Vessel Segmentation**, then load a 3D volume in napari (OME-Zarr or other).
+2. **Coarse level** — **Layers → Pyramid level** → choose a **coarse** level (not finest).
+3. **Image & mask** — Select **Image**. Choose or create **Segmentation mask** (empty is OK for the first branch).
+4. **(Optional) Blockers** — **New Blocker** if growth leaks at organ boundaries.
+5. **One branch** — Add branch points (click order) → **Compute Branch** → edit **`Draft_Branch`** if needed → **Merge Branch**.
+6. **More branches at this level?** — **Reset branch points** and **repeat step 5**. With **CleanUp** checked (default), **Merge Branch** already clears archived **`Draft_Branch (N)`** layers and extra **`BranchPoints_*`** layers — you usually just place the next polyline.
+7. **Finer detail (optional)** — Switch to a **finer Pyramid level** and grow more branches, and/or use **optional Post-processing** upsampling or morphology if you need a finer grid or cleaner boundaries.
+8. **Export** — **Saving → Save segmentation** when satisfied.
 
 ---
 
 ## Step-by-step (detailed)
-
-### Detailed steps
 
 1. Open napari. Open the widget: **Plugins → Region Grow Vessel Segmentation**.
 2. Load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory.
