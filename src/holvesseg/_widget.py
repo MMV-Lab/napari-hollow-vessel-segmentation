@@ -3911,6 +3911,8 @@ class HolvessegWidget(QWidget):
                 self.status_label.setText(str(status))
             if cleanup:
                 QTimer.singleShot(50, self._finish_merge_ui_sync)
+            else:
+                self._activate_branch_points_layer_in_viewer()
             if getattr(self, "_merge_ndisplay_deferred", False):
                 self._merge_ndisplay_deferred = False
                 QTimer.singleShot(50, self._finish_merge_ndisplay_sync)
@@ -3919,12 +3921,35 @@ class HolvessegWidget(QWidget):
         self._update_pyramid_display_layers()
         self._schedule_mask_colormap_resync()
 
+    def _activate_branch_points_layer_in_viewer(self) -> None:
+        """Select the current branch points layer in napari (for placing the next branch)."""
+        name = self.branch_combo.currentText().strip()
+        if not name or name not in self.viewer.layers:
+            name = "BranchPoints"
+        if name not in self.viewer.layers:
+            return
+        lyr = self.viewer.layers[name]
+        if not isinstance(lyr, napari.layers.Points):
+            return
+        try:
+            lyr.visible = True
+        except Exception:
+            pass
+        try:
+            self.viewer.layers.selection.active = lyr
+        except Exception:
+            try:
+                self.viewer.layers.selection = [lyr]
+            except Exception:
+                pass
+
     def _finish_merge_ui_sync(self) -> None:
         """Refresh dock combos after merge cleanup (debounced, post-canvas)."""
         self._refresh_layers()
         _select_combo_layer(self.branch_combo, "BranchPoints")
         self._on_branch_combo_color_target()
         _select_combo_layer(self.draft_branch_combo, DRAFT_BRANCH_LAYER_NAME)
+        self._activate_branch_points_layer_in_viewer()
 
     def _run_deferred_merge_cleanup(self) -> None:
         """Legacy alias — kept for any in-flight singleShot callbacks."""
