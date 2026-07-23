@@ -216,6 +216,34 @@ def _sync_binary_labels_colormap(lyr: Any, color: str) -> None:
         pass
 
 
+def _sync_mask_colormap_for_ndisplay(lyr: Any, color: str, *, nd: int) -> None:
+    """2D: binary colormap + optional show-selected (eraser). 3D: all foreground labels, no selection."""
+    if not isinstance(lyr, napari.layers.Labels):
+        return
+    _configure_binary_labels_layer(lyr)
+    try:
+        if nd >= 3:
+            data = np.asarray(lyr.data)
+            color_dict: dict = {0: "transparent", None: "transparent"}
+            for raw in np.unique(data):
+                lab = int(raw)
+                if lab == 0:
+                    continue
+                color_dict[lab] = str(color)
+            if len(color_dict) <= 2:
+                color_dict[1] = str(color)
+            lyr.colormap = DirectLabelColormap(
+                color_dict=color_dict,
+                use_selection=False,
+            )
+            lyr.show_selected_label = False
+            lyr.rendering = "translucent"
+        else:
+            _sync_binary_labels_colormap(lyr, color)
+    except Exception:
+        pass
+
+
 def _init_binary_labels_layer(lyr: Any, color: str) -> None:
     """One-time setup for a new editable binary mask layer."""
     _configure_binary_labels_layer(lyr)
@@ -677,6 +705,12 @@ class HolvessegWidget(QWidget):
         self._merge_postprocess_payload: Optional[dict] = None
         self._merge_layers_mutating = False
         self._merge_ndisplay_deferred = False
+        self._labels_colormap_resync_timer = QTimer(self)
+        self._labels_colormap_resync_timer.setSingleShot(True)
+        self._labels_colormap_resync_timer.setInterval(120)
+        self._labels_colormap_resync_timer.timeout.connect(
+            self._resync_mask_colormaps_after_ndisplay
+        )
         self._labels_show_selected_2d: dict[str, bool] = {}
         self._ndisplay_sync_pending = False
         self._growth_capture_frames: List[np.ndarray] = []
@@ -2879,21 +2913,16 @@ class HolvessegWidget(QWidget):
         self._ndisplay_sync_pending = True
         self._ndisplay_sync_timer.start()
 
-    def _resync_binary_labels_after_ndisplay_change(self) -> None:
-        """Refresh mask layers after 2D↔3D switch (VisPy label volumes lose textures easily)."""
+    def _schedule_mask_colormap_resync(self) -> None:
+        """Run mask colormap sync after the 3D image proxy has finished rebuilding."""
+        self._labels_colormap_resync_timer.start()
+
+    def _resync_mask_colormaps_after_ndisplay(self) -> None:
+        """Lightweight mask display sync after 2D↔3D (no ``.data`` reload — avoids napari loading UI glitches)."""
         try:
             nd = int(self.viewer.dims.ndisplay)
         except (TypeError, ValueError, AttributeError):
             nd = 2
-        img = self._get_selected_image_layer()
-        skw: dict = {}
-        if img is not None:
-            try:
-                skw = spatial_alignment_for_pyramid_level(
-                    img, int(self._selected_pyramid_level())
-                )
-            except Exception:
-                skw = {}
 
         store = self._labels_show_selected_2d
         for lyr in list(self.viewer.layers):
@@ -2902,32 +2931,24 @@ class HolvessegWidget(QWidget):
             if not self._is_segmentation_labels_layer(lyr):
                 continue
             nm = str(lyr.name)
-            if skw:
-                _apply_spatial_kwargs_to_layer(lyr, skw)
+            if _is_branch_draft_labels_name(nm):
+                color = _draft_branch_color_for_layer_name(nm)
+            else:
+                color = self._layer_color(nm, DEFAULT_SEGMENTATION_COLOR)
             if nd >= 3:
                 if nm not in store:
                     store[nm] = bool(getattr(lyr, "show_selected_label", False))
-                _ensure_labels_show_selected(lyr, label=1)
-                try:
-                    lyr.rendering = "translucent"
-                except Exception:
-                    pass
             else:
                 show = store.pop(nm, False)
                 try:
                     lyr.show_selected_label = bool(show)
                 except Exception:
                     pass
-            self._apply_stored_labels_color(lyr)
+            _sync_mask_colormap_for_ndisplay(lyr, color, nd=nd)
             try:
-                arr = np.ascontiguousarray(np.asarray(lyr.data, dtype=np.int32))
-                _update_labels_layer_data(lyr, arr)
+                lyr.visible = True
             except Exception:
                 pass
-        try:
-            self.viewer.canvas.update()
-        except Exception:
-            pass
 
     def _on_ndisplay_changed(self, event=None) -> None:
         """Keep blocker labels 3D-safe; defer pyramid proxies and label textures."""
@@ -2956,7 +2977,7 @@ class HolvessegWidget(QWidget):
                     self._merge_ndisplay_deferred = True
                     return
                 self._update_pyramid_display_layers()
-                self._resync_binary_labels_after_ndisplay_change()
+                self._schedule_mask_colormap_resync()
             finally:
                 self._grow_view_transition = False
                 self._apply_pending_grow_step()
@@ -2967,7 +2988,7 @@ class HolvessegWidget(QWidget):
         if getattr(self, "_merge_ndisplay_deferred", False):
             self._merge_ndisplay_deferred = False
         self._update_pyramid_display_layers()
-        self._resync_binary_labels_after_ndisplay_change()
+        self._schedule_mask_colormap_resync()
 
     def _apply_pending_grow_step(self) -> None:
         pending = self._pending_grow_step_result
@@ -3896,7 +3917,7 @@ class HolvessegWidget(QWidget):
 
     def _finish_merge_ndisplay_sync(self) -> None:
         self._update_pyramid_display_layers()
-        self._resync_binary_labels_after_ndisplay_change()
+        self._schedule_mask_colormap_resync()
 
     def _finish_merge_ui_sync(self) -> None:
         """Refresh dock combos after merge cleanup (debounced, post-canvas)."""
