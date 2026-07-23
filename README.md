@@ -25,12 +25,6 @@ The plugin uses one workflow for every vessel segment (main trunk or side branch
 pip install -e .
 ```
 
-Development / tests:
-
-```bash
-pip install -e ".[test]"
-```
-
 **Console scripts:** `regiongrow-convert-to-ome-zarr`, `regiongrow-preprocess-zarr`, `regiongrow-preprocess-ome-tiff` (see [OME-Zarr and large volumes](#ome-zarr-and-large-volumes)). Open the dock: **Plugins → Region Grow Vessel Segmentation**.
 
 ---

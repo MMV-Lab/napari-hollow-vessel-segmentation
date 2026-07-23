@@ -43,12 +43,6 @@ dependencies = [
     "bioio-imageio>=1.0",
 ]
 
-[project.optional-dependencies]
-test = [
-    "pytest>=7",
-    "pytest-qt",
-]
-
 [project.scripts]
 regiongrow-convert-to-ome-zarr = "regiongrow.cli.to_ome_zarr:main"
 regiongrow-preprocess-zarr = "regiongrow.cli.preprocess_zarr:main"
@@ -65,6 +59,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 regiongrow = ["napari.yaml"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
