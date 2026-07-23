@@ -666,7 +666,7 @@ class HolvessegWidget(QWidget):
         self._ndisplay_sync_timer.setSingleShot(True)
         self._ndisplay_sync_timer.setInterval(50)
         self._ndisplay_sync_timer.timeout.connect(
-            self._finish_ndisplay_sync_during_grow
+            self._finish_deferred_ndisplay_sync
         )
         self._merge_postprocess_timer = QTimer(self)
         self._merge_postprocess_timer.setSingleShot(True)
@@ -677,7 +677,8 @@ class HolvessegWidget(QWidget):
         self._merge_postprocess_payload: Optional[dict] = None
         self._merge_layers_mutating = False
         self._merge_ndisplay_deferred = False
-
+        self._labels_show_selected_2d: dict[str, bool] = {}
+        self._ndisplay_sync_pending = False
         self._growth_capture_frames: List[np.ndarray] = []
         self._growth_capture_step_counter = 0
         self._growth_capture_finalized = False
@@ -2873,8 +2874,63 @@ class HolvessegWidget(QWidget):
                     continue
             lyr.size = new_size
 
+    def _schedule_deferred_ndisplay_sync(self) -> None:
+        """Defer pyramid proxy + label texture work out of the VisPy draw pass."""
+        self._ndisplay_sync_pending = True
+        self._ndisplay_sync_timer.start()
+
+    def _resync_binary_labels_after_ndisplay_change(self) -> None:
+        """Refresh mask layers after 2D↔3D switch (VisPy label volumes lose textures easily)."""
+        try:
+            nd = int(self.viewer.dims.ndisplay)
+        except (TypeError, ValueError, AttributeError):
+            nd = 2
+        img = self._get_selected_image_layer()
+        skw: dict = {}
+        if img is not None:
+            try:
+                skw = spatial_alignment_for_pyramid_level(
+                    img, int(self._selected_pyramid_level())
+                )
+            except Exception:
+                skw = {}
+
+        store = self._labels_show_selected_2d
+        for lyr in list(self.viewer.layers):
+            if not isinstance(lyr, napari.layers.Labels):
+                continue
+            if not self._is_segmentation_labels_layer(lyr):
+                continue
+            nm = str(lyr.name)
+            if skw:
+                _apply_spatial_kwargs_to_layer(lyr, skw)
+            if nd >= 3:
+                if nm not in store:
+                    store[nm] = bool(getattr(lyr, "show_selected_label", False))
+                _ensure_labels_show_selected(lyr, label=1)
+                try:
+                    lyr.rendering = "translucent"
+                except Exception:
+                    pass
+            else:
+                show = store.pop(nm, False)
+                try:
+                    lyr.show_selected_label = bool(show)
+                except Exception:
+                    pass
+            self._apply_stored_labels_color(lyr)
+            try:
+                arr = np.ascontiguousarray(np.asarray(lyr.data, dtype=np.int32))
+                _update_labels_layer_data(lyr, arr)
+            except Exception:
+                pass
+        try:
+            self.viewer.canvas.update()
+        except Exception:
+            pass
+
     def _on_ndisplay_changed(self, event=None) -> None:
-        """Keep blocker labels 3D-safe; sync pyramid display proxies on 2D/3D switch."""
+        """Keep blocker labels 3D-safe; defer pyramid proxies and label textures."""
         try:
             int(self.viewer.dims.ndisplay)
         except (TypeError, ValueError, AttributeError):
@@ -2885,27 +2941,22 @@ class HolvessegWidget(QWidget):
             ):
                 _ensure_blocker_labels_ndim3(lyr)
 
-        # While Compute Branch is running, defer proxy/volume rebuilds so VisPy is not
-        # updating label textures in the same draw pass as the 2D↔3D canvas switch.
         if getattr(self, "_active_branch_job", None) == "grow":
             self._grow_view_transition = True
-            self._ndisplay_sync_timer.start()
-            return
         if self._merge_postprocess_active():
             self._merge_ndisplay_deferred = True
-            self._ndisplay_sync_timer.start()
-            return
+        self._schedule_deferred_ndisplay_sync()
 
-        self._update_pyramid_display_layers()
-
-    def _finish_ndisplay_sync_during_grow(self) -> None:
-        """Apply deferred pyramid proxies after a 2D↔3D switch during grow or merge."""
+    def _finish_deferred_ndisplay_sync(self) -> None:
+        """Apply deferred pyramid proxies and label refresh after 2D↔3D switch."""
+        self._ndisplay_sync_pending = False
         if getattr(self, "_active_branch_job", None) == "grow":
             try:
                 if self._merge_postprocess_active():
                     self._merge_ndisplay_deferred = True
                     return
                 self._update_pyramid_display_layers()
+                self._resync_binary_labels_after_ndisplay_change()
             finally:
                 self._grow_view_transition = False
                 self._apply_pending_grow_step()
@@ -2916,6 +2967,7 @@ class HolvessegWidget(QWidget):
         if getattr(self, "_merge_ndisplay_deferred", False):
             self._merge_ndisplay_deferred = False
         self._update_pyramid_display_layers()
+        self._resync_binary_labels_after_ndisplay_change()
 
     def _apply_pending_grow_step(self) -> None:
         pending = self._pending_grow_step_result
@@ -3840,7 +3892,11 @@ class HolvessegWidget(QWidget):
                 QTimer.singleShot(50, self._finish_merge_ui_sync)
             if getattr(self, "_merge_ndisplay_deferred", False):
                 self._merge_ndisplay_deferred = False
-                QTimer.singleShot(50, self._update_pyramid_display_layers)
+                QTimer.singleShot(50, self._finish_merge_ndisplay_sync)
+
+    def _finish_merge_ndisplay_sync(self) -> None:
+        self._update_pyramid_display_layers()
+        self._resync_binary_labels_after_ndisplay_change()
 
     def _finish_merge_ui_sync(self) -> None:
         """Refresh dock combos after merge cleanup (debounced, post-canvas)."""
