@@ -1,6 +1,6 @@
-"""Region Grow: A napari plugin for 3D vessel segmentation."""
+"""HolVesSeg (holvesseg): napari plugin for hollow vessel branch segmentation."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import sys as _sys
 

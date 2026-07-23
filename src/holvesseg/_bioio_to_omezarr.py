@@ -186,7 +186,7 @@ def _ome_spatial_scales_microns(path: Path) -> Tuple[Dict[str, float], bool]:
     try:
         import tifffile as tf
 
-        from regiongrow._ome_reader import _ome_axis_scales_microns
+        from holvesseg._ome_reader import _ome_axis_scales_microns
 
         with tf.TiffFile(path) as tif:
             xml = tif.ome_metadata
@@ -346,8 +346,8 @@ def ngff_writer_kwargs_from_bioimage(
         "physical_pixel_size": physical_pixel_size,
         "channels": _channels_for_writer(img, dim_names, data_shape),
         "creator_info": {
-            "name": "regiongrow",
-            "version": __import__("regiongrow", fromlist=["__version__"]).__version__,
+            "name": "holvesseg",
+            "version": __import__("holvesseg", fromlist=["__version__"]).__version__,
             "source": str(input_path),
         },
     }

@@ -24,8 +24,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import numpy as np
 import zarr
 
-from regiongrow._preprocessing import contrast_range_from_crop, stretch_contrast
-from regiongrow._zarr_compat import (
+from holvesseg._preprocessing import contrast_range_from_crop, stretch_contrast
+from holvesseg._zarr_compat import (
     zarr_create_array,
     zarr_format_of,
     zarr_numcodecs_blosc_like_input,
@@ -104,7 +104,7 @@ def _percentile_from_hist(counts: np.ndarray, p_low: float, p_high: float) -> Tu
 def _percentile_limits_like_in_memory(
     arr: zarr.Array, p_low: float, p_high: float, *, max_samples: int = 12_000_000
 ) -> Tuple[float, float]:
-    """Same contract as :func:`regiongrow._preprocessing.contrast_range_from_crop` (``np.percentile``)."""
+    """Same contract as :func:`holvesseg._preprocessing.contrast_range_from_crop` (``np.percentile``)."""
     parts: List[np.ndarray] = []
     n = 0
     for sl in _chunk_slices_3d(arr):
@@ -123,7 +123,7 @@ def _percentile_limits_like_in_memory(
 
 
 def _stretch_block(block: np.ndarray, lo: float, hi: float, out_dtype_str: str) -> np.ndarray:
-    """Match :func:`regiongrow._preprocessing.stretch_contrast` (in-memory preprocessing / widget)."""
+    """Match :func:`holvesseg._preprocessing.stretch_contrast` (in-memory preprocessing / widget)."""
     out, _ = stretch_contrast(np.asarray(block), lo, hi, out_dtype=out_dtype_str)
     return out
 
@@ -343,7 +343,7 @@ def _write_pyramid_metadata(
         ome = dict(root.attrs.get("ome", {}))
         ome["multiscales"] = [block]
         root.attrs["ome"] = ome
-    root.attrs["regiongrow_dtype"] = dtype_str
+    root.attrs["holvesseg_dtype"] = dtype_str
 
 
 def _write_omero_for_layout(

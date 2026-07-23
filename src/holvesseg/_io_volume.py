@@ -14,7 +14,7 @@ from ._ome_reader import read_ome_tiff, volume_zyx_spacing_meta_from_stack
 def load_volume_zyx_from_path(path: str | Path) -> Tuple[np.ndarray, Tuple[float, float, float], Dict[str, Any]]:
     """Load a single-channel 3-D volume as ZYX and spacing (Z, Y, X) in micrometres.
 
-    Uses the same axis / OME spacing rules as :func:`regiongrow._ome_reader.read_ome_tiff`.
+    Uses the same axis / OME spacing rules as :func:`holvesseg._ome_reader.read_ome_tiff`.
     For ``*.ome.tif`` / ``*.ome.tiff`` delegates to that reader. Other TIFFs use tifffile
     series 0 with spacing defaulting to 1 µm if no OME XML is present.
     """

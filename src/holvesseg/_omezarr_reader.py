@@ -72,7 +72,7 @@ def _label_group_level_shapes(
     """Map pyramid keys → shapes for ``labels/<name>`` without decoding arrays."""
     import zarr
 
-    from regiongrow._zarr_compat import zarr_array_keys
+    from holvesseg._zarr_compat import zarr_array_keys
 
     path = resolve_omezarr_store_root(Path(store))
     try:
@@ -167,7 +167,7 @@ def _label_group_names_on_disk(store: str | Path) -> List[str]:
     """Subgroup names under ``labels/`` that look like readable NGFF label groups."""
     import zarr
 
-    from regiongrow._zarr_compat import zarr_subgroup_keys
+    from holvesseg._zarr_compat import zarr_subgroup_keys
 
     path = resolve_omezarr_store_root(Path(store))
     try:
@@ -518,7 +518,7 @@ def materialize_saved_labels_at_shape(
     label_name: Optional[str] = None,
 ) -> Optional[Tuple[np.ndarray, str]]:
     """Load saved NGFF labels and resample to *target_shape* (Z,Y,X) for napari."""
-    from regiongrow._save_segmentation_zarr import read_zarr_labels_at_shape
+    from holvesseg._save_segmentation_zarr import read_zarr_labels_at_shape
 
     path = resolve_omezarr_store_root(Path(store))
     label_names = _ngff_label_names_from_store(path)
@@ -538,7 +538,7 @@ def materialize_saved_labels_at_shape(
 
     import zarr
 
-    from regiongrow._zarr_compat import zarr_array_keys
+    from holvesseg._zarr_compat import zarr_array_keys
 
     try:
         root = zarr.open_group(str(path), mode="r")
@@ -648,7 +648,7 @@ def read_omezarr_image(path: str | Path) -> List[LayerDataTuple]:
             list(image_node.data), dict(image_node.metadata or {})
         )
         layer_kw: Dict[str, Any] = {"name": name, "metadata": imeta}
-        from regiongrow._volume_utils import ngff_finest_voxel_spacing_zyx
+        from holvesseg._volume_utils import ngff_finest_voxel_spacing_zyx
 
         finest_scale = ngff_finest_voxel_spacing_zyx(imeta)
         if finest_scale is not None:

@@ -1,12 +1,12 @@
 """Preprocess an OME-TIFF on disk (mean downsample + contrast stretch), then convert to Zarr separately.
 
-Uses the same parameters as ``regiongrow-preprocess-zarr`` (except ``--finest-only``, which
+Uses the same parameters as ``holvesseg-preprocess-zarr`` (except ``--finest-only``, which
 is ignored for a single-resolution TIFF). Requires ``tifffile`` (already a core dependency).
 
 Example::
 
-    regiongrow-preprocess-ome-tiff in.ome.tif out.ome.tif --stretch
-    regiongrow-convert-to-ome-zarr out.ome.tif
+    holvesseg-preprocess-ome-tiff in.ome.tif out.ome.tif --stretch
+    holvesseg-convert-to-ome-zarr out.ome.tif
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from regiongrow._preprocess_ome_tiff import run_preprocess_ome_tiff_pipeline
+from holvesseg._preprocess_ome_tiff import run_preprocess_ome_tiff_pipeline
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -24,7 +24,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=(
             "Load an OME-TIFF as a single-channel (Z, Y, X) volume, optionally mean-downsample "
             "in Z and XY, optionally contrast-stretch, and write a new OME-TIFF. "
-            "Convert to OME-Zarr afterwards (e.g. regiongrow-convert-to-ome-zarr)."
+            "Convert to OME-Zarr afterwards (e.g. holvesseg-convert-to-ome-zarr)."
         )
     )
     p.add_argument("input", type=Path, help="Input OME-TIFF (.ome.tif / .ome.tiff)")
@@ -86,7 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if in_low.endswith(".ome.zarr") or in_low.endswith(".zarr"):
         print(
             "This command preprocesses OME-TIFF files only. For OME-Zarr input/output use:\n"
-            "  regiongrow-preprocess-zarr …\n"
+            "  holvesseg-preprocess-zarr …\n"
             f"(got: {inp})",
             file=sys.stderr,
         )

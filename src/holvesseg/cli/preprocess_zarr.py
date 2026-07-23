@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from regiongrow._preprocessing_zarr import run_preprocess_zarr_pipeline
+from holvesseg._preprocessing_zarr import run_preprocess_zarr_pipeline
 
 
 def main(argv: Sequence[str] | None = None) -> int:

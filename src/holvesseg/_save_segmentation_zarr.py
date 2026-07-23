@@ -22,7 +22,7 @@ import numpy as np
 import zarr
 
 # Reuse robust NGFF metadata helpers already used by the zarr preprocessing pipeline.
-from regiongrow._preprocessing_zarr import (  # noqa: WPS433 (internal import ok within package)
+from holvesseg._preprocessing_zarr import (  # noqa: WPS433 (internal import ok within package)
     _chunk_slices_3d,
     _dst_range_to_src_range,
     _ensure_multiscales_image_for_reader,
@@ -30,7 +30,7 @@ from regiongrow._preprocessing_zarr import (  # noqa: WPS433 (internal import ok
     _multiscales_layout,
     _read_multiscales_datasets,
 )
-from regiongrow._zarr_compat import (
+from holvesseg._zarr_compat import (
     zarr_array_keys,
     zarr_create_array,
     zarr_open_group_append,
@@ -651,7 +651,7 @@ def _write_segmentation_labels(
             # Commit: swap the finished staging group over the live group, then
             # advertise the name in the root list only after data is in place.
             _swap_labels_group_on_disk(store_path, name, staging_name)
-            from regiongrow._omezarr_reader import _ngff_label_names_from_store
+            from holvesseg._omezarr_reader import _ngff_label_names_from_store
 
             _set_labels_list(root, layout, _ngff_label_names_from_store(store_path))
         except BaseException:

@@ -1,8 +1,8 @@
 """In-memory preprocessing for OME-TIFF volumes (same steps as the Zarr pipeline).
 
 Mean downsample (optional) then contrast stretch (optional), using
-:func:`regiongrow._preprocessing.contrast_range_from_crop` and
-:func:`regiongrow._preprocessing.stretch_contrast`.
+:func:`holvesseg._preprocessing.contrast_range_from_crop` and
+:func:`holvesseg._preprocessing.stretch_contrast`.
 
 The full volume is loaded into RAM. Writes use ``tifffile`` ``ome=True`` with **lossless
 zlib** by default (predictor on) so outputs are much smaller than uncompressed TIFF;
@@ -17,12 +17,12 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import tifffile as tf
 
-from regiongrow._ome_reader import volume_zyx_spacing_meta_from_stack
-from regiongrow._preprocessing import contrast_range_from_crop, stretch_contrast
+from holvesseg._ome_reader import volume_zyx_spacing_meta_from_stack
+from holvesseg._preprocessing import contrast_range_from_crop, stretch_contrast
 
 
 def _mean_pool_zyx(vol: np.ndarray, fz: int, fxy: int) -> np.ndarray:
-    """Integer mean pool (same rule as :func:`regiongrow._preprocessing_zarr._mean_pool_write`)."""
+    """Integer mean pool (same rule as :func:`holvesseg._preprocessing_zarr._mean_pool_write`)."""
     fz = max(1, int(fz))
     fxy = max(1, int(fxy))
     z, y, x = vol.shape

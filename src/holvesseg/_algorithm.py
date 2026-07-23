@@ -530,7 +530,7 @@ def polyline_corridor_mask(
 ) -> np.ndarray:
     """Voxels within physical distance *R* of the rasterized polyline centerline.
 
-    Branch MGAC used to clip with :func:`regiongrow._active_contour._length_mask`
+    Branch MGAC used to clip with :func:`holvesseg._active_contour._length_mask`
     (cylinder between first and last knot only).  Curved branches then had most
     of the seed tube **outside** that cylinder, so ``init_level_set & lmask``
     was tiny or empty and the contour eroded away.  This mask follows the

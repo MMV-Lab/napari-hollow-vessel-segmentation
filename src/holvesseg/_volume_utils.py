@@ -270,7 +270,7 @@ def pyramid_navigation_axis_ranges_zyx(
     ``step`` is ``downsample_factor × finest_spacing`` so each tick is one
     working-level plane without overshooting past the last valid slice.
     """
-    from regiongrow._spatial import world_bounds_zyx_for_pyramid_level
+    from holvesseg._spatial import world_bounds_zyx_for_pyramid_level
 
     steps = pyramid_axis_steps(layer, int(level))
     if steps == (1, 1, 1):
@@ -400,7 +400,7 @@ def tube_radius_voxels_for_work_level(
 ) -> float:
     """Map UI tube radius (finest isotropic voxel radii) to voxels at *level*.
 
-    :func:`regiongrow._algorithm.polyline_tube_mask` and MGAC use
+    :func:`holvesseg._algorithm.polyline_tube_mask` and MGAC use
     ``radius_phys = radius_vox * min(spacing)``.  Coarser pyramid levels have
     larger *spacing*, so the same spin would otherwise grow in world units.
     This keeps ``radius_phys = radius_ui * min(finest spacing)`` at every level.
@@ -427,7 +427,7 @@ def axis_margin_voxels_for_work_level(
 ) -> float:
     """Scale length-margin spin so ``margin × mean(spacing_work)`` matches finest.
 
-    :func:`regiongrow._algorithm.region_grow` uses
+    :func:`holvesseg._algorithm.region_grow` uses
     ``margin_phys = margin * mean(spacing)``.  Interpreting the spin at the
     finest level gives reproducible physical slack when switching pyramid levels.
     """

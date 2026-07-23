@@ -72,11 +72,11 @@ def spatial_alignment_kwargs(ref_layer: Any) -> Dict[str, Any]:
 def spatial_alignment_for_pyramid_level(ref_layer: Any, level: int) -> Dict[str, Any]:
     """Spatial kwargs for a layer whose ``data.shape`` matches pyramid *level*.
 
-    ``scale`` is set from :func:`regiongrow._volume_utils.voxel_spacing_zyx_for_level`
+    ``scale`` is set from :func:`holvesseg._volume_utils.voxel_spacing_zyx_for_level`
     so anisotropic NGFF metadata is honoured even when ``ref_layer.scale`` is still
     ``(1, 1, 1)``. ``translate`` / ``rotate`` / ``shear`` are copied from the image.
     """
-    from regiongrow._volume_utils import (
+    from holvesseg._volume_utils import (
         image_level_shape,
         voxel_spacing_zyx_for_level,
         voxel_spacing_zyx_finest,
@@ -117,7 +117,7 @@ def spatial_alignment_for_saved_labels(
     image finest grid.  Align to whichever image pyramid level matches the
     finest labels array shape so the mask is not shifted off-screen (looks empty).
     """
-    from regiongrow._volume_utils import (
+    from holvesseg._volume_utils import (
         finest_labels_data_shape,
         image_level_index_for_shape,
     )
@@ -136,7 +136,7 @@ def world_bounds_zyx_for_pyramid_level(
     ref_layer: Any, level: int
 ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
     """Inclusive world (min, max) along Z, Y, X for voxels at pyramid *level*."""
-    from regiongrow._volume_utils import image_level_shape
+    from holvesseg._volume_utils import image_level_shape
 
     skw = spatial_alignment_for_pyramid_level(ref_layer, int(level))
     try:

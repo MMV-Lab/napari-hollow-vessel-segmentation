@@ -267,7 +267,7 @@ def _polyline_indices_for_level(
     if poly_fine.size == 0:
         return poly_fine.astype(np.int64)
     sz = tuple(int(x) for x in shape_work)
-    from regiongrow._volume_utils import _level_downsample_factors
+    from holvesseg._volume_utils import _level_downsample_factors
 
     df = np.asarray(
         _level_downsample_factors(image_layer, int(level), sz),
@@ -643,7 +643,7 @@ def _collapsible_section(
     return outer
 
 
-class RegionGrowWidget(QWidget):
+class HolvessegWidget(QWidget):
     """Widget for 3D vessel segmentation via polyline-based plain / MGAC grow and merge."""
 
     def __init__(self, napari_viewer: "napari.Viewer"):
@@ -4581,7 +4581,7 @@ class RegionGrowWidget(QWidget):
 
         Returns the method key (``'otsu'`` …) or ``None`` if the upper threshold
         is disabled.  The image-dependent value is computed later in the worker
-        via :func:`regiongrow._algorithm.compute_upper_threshold`; this keeps all
+        via :func:`holvesseg._algorithm.compute_upper_threshold`; this keeps all
         Qt widget access on the main thread.
         """
         if not self.branch_plain_upper_thr_check.isChecked():

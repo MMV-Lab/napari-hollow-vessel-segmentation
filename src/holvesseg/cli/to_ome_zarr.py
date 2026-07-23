@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
-from regiongrow._bioio_to_omezarr import convert_image_to_omezarr
+from holvesseg._bioio_to_omezarr import convert_image_to_omezarr
 
 
 def _parse_voxel_size(spec: str) -> Tuple[float, float, float]:

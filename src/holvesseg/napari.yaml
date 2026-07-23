@@ -1,0 +1,34 @@
+name: holvesseg
+display_name: Hollow Vessel Branch Segmentation
+schema_version: 0.2.0
+contributions:
+  commands:
+    - id: holvesseg.make_widget
+      python_name: holvesseg._widget:HolvessegWidget
+      title: Hollow Vessel Branch Segmentation
+    - id: holvesseg.read_ome_tiff
+      python_name: holvesseg._ome_reader:napari_get_reader
+      title: Read OME-TIFF with voxel spacing
+    - id: holvesseg.read_omezarr_with_segmentation
+      python_name: holvesseg._omezarr_reader:napari_get_reader
+      title: Read OME-Zarr image
+    - id: holvesseg.sample_data
+      python_name: holvesseg._sample_data:make_sample_vessel
+      title: Synthetic Hollow Vessel
+  readers:
+    - command: holvesseg.read_ome_tiff
+      filename_patterns:
+        - '*.ome.tif'
+        - '*.ome.tiff'
+      accepts_directories: false
+    - command: holvesseg.read_omezarr_with_segmentation
+      filename_patterns:
+        - '*.ome.zarr'
+      accepts_directories: true
+  widgets:
+    - command: holvesseg.make_widget
+      display_name: Hollow Vessel Branch Segmentation
+  sample_data:
+    - command: holvesseg.sample_data
+      display_name: Synthetic Hollow Vessel
+      key: synthetic-hollow-vessel

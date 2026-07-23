@@ -1,4 +1,4 @@
-# Region Grow — 3D vessel segmentation for napari
+# Hollow vessel branch segmentation for napari
 
 Interactive **semi-automatic** segmentation of **hollow vessels** in 3D fluorescence microscopy. You place ordered points along a branch; the plugin grows a 3D mask along that path and you **merge** it into a master labels layer, branch by branch.
 
@@ -22,10 +22,12 @@ The plugin uses one workflow for every vessel segment (main trunk or side branch
 **Python ≥ 3.11**, napari with a Qt backend (e.g. `pip install "napari[all]"`).
 
 ```bash
+git clone https://github.com/MMV-Lab/napari-hollow-vessel-segmentation.git
+cd napari-hollow-vessel-segmentation
 pip install -e .
 ```
 
-**Console scripts:** `regiongrow-convert-to-ome-zarr`, `regiongrow-preprocess-zarr`, `regiongrow-preprocess-ome-tiff` (see [OME-Zarr and large volumes](#ome-zarr-and-large-volumes)). Open the dock: **Plugins → Region Grow Vessel Segmentation**.
+**Console scripts:** `holvesseg-convert-to-ome-zarr`, `holvesseg-preprocess-zarr`, `holvesseg-preprocess-ome-tiff` (see [OME-Zarr and large volumes](#ome-zarr-and-large-volumes)). Open the dock: **Plugins → Hollow Vessel Branch Segmentation**.
 
 ---
 
@@ -44,9 +46,9 @@ Typical pipeline: **convert** stacks to OME-Zarr, **optionally preprocess** (con
 
 | CLI | Role |
 |-----|------|
-| `regiongrow-convert-to-ome-zarr` | Build a multiscale pyramid from TIFF, OME-TIFF, etc. |
-| `regiongrow-preprocess-zarr` | Stream-read an `.ome.zarr`, optionally mean-downsample and/or contrast-stretch, write a **new** `.ome.zarr` |
-| `regiongrow-preprocess-ome-tiff` | Same preprocessing ideas on a single OME-TIFF; convert to Zarr separately |
+| `holvesseg-convert-to-ome-zarr` | Build a multiscale pyramid from TIFF, OME-TIFF, etc. |
+| `holvesseg-preprocess-zarr` | Stream-read an `.ome.zarr`, optionally mean-downsample and/or contrast-stretch, write a **new** `.ome.zarr` |
+| `holvesseg-preprocess-ome-tiff` | Same preprocessing ideas on a single OME-TIFF; convert to Zarr separately |
 
 <details>
 <summary><strong>Preprocessing</strong> — what it does and CLI flags</summary>
@@ -54,7 +56,7 @@ Typical pipeline: **convert** stacks to OME-Zarr, **optionally preprocess** (con
 **What preprocessing is for**
 
 - **Contrast stretch** — maps intensity into a display-friendly range (default output **uint8**). Useful when raw 16-bit stacks look flat in napari or when MGAC edge terms need stronger local contrast. Stretch is **off unless you pass `--stretch`**.
-- **Mean downsample** — integer factors in **Z** and/or **XY** shrink the **finest** resolution before coarser pyramid levels are **rebuilt** from that result (`regiongrow-preprocess-zarr` keeps the same NGFF multiscale layout as the input unless you use `--finest-only`).
+- **Mean downsample** — integer factors in **Z** and/or **XY** shrink the **finest** resolution before coarser pyramid levels are **rebuilt** from that result (`holvesseg-preprocess-zarr` keeps the same NGFF multiscale layout as the input unless you use `--finest-only`).
 - **Why a separate CLI** — whole-organ volumes do not fit in RAM; these tools never materialize the full volume at once.
 
 **Workflow notes**
@@ -62,12 +64,12 @@ Typical pipeline: **convert** stacks to OME-Zarr, **optionally preprocess** (con
 - Output paths must **not exist** unless you pass **`--overwrite`** (Zarr: directory removed and recreated; TIFF: file replaced).
 - **`--no-downsample`** — skip downsampling even if `--downsample-z` / `--downsample-xy` are &gt; 1 (common with **`--stretch`** only).
 - Downsampling runs only when **`--no-downsample` is absent** and at least one of **`--downsample-z`** or **`--downsample-xy`** is **&gt; 1** (defaults for both are **1** = no shrink).
-- After **`regiongrow-preprocess-ome-tiff`**, run **`regiongrow-convert-to-ome-zarr`** on the new TIFF to get a pyramid for napari.
+- After **`holvesseg-preprocess-ome-tiff`**, run **`holvesseg-convert-to-ome-zarr`** on the new TIFF to get a pyramid for napari.
 
-#### `regiongrow-preprocess-zarr`
+#### `holvesseg-preprocess-zarr`
 
 ```text
-regiongrow-preprocess-zarr INPUT.ome.zarr OUTPUT.ome.zarr [options]
+holvesseg-preprocess-zarr INPUT.ome.zarr OUTPUT.ome.zarr [options]
 ```
 
 | Flag | Default | Meaning |
@@ -85,12 +87,12 @@ regiongrow-preprocess-zarr INPUT.ome.zarr OUTPUT.ome.zarr [options]
 | **`--out-dtype`** | `uint8` | Output integer dtype after stretch: **`uint8`** or **`uint16`**. |
 | **`--finest-only`** | off | Write **only** the finest dataset (no coarser NGFF levels). Legacy / special cases; normal use keeps the full pyramid. |
 
-#### `regiongrow-preprocess-ome-tiff`
+#### `holvesseg-preprocess-ome-tiff`
 
-Same core flags as **`regiongrow-preprocess-zarr`**, plus TIFF write options. **`--finest-only`** is accepted for CLI parity but **has no effect** on a single-resolution TIFF.
+Same core flags as **`holvesseg-preprocess-zarr`**, plus TIFF write options. **`--finest-only`** is accepted for CLI parity but **has no effect** on a single-resolution TIFF.
 
 ```text
-regiongrow-preprocess-ome-tiff INPUT.ome.tif OUTPUT.ome.tif [options]
+holvesseg-preprocess-ome-tiff INPUT.ome.tif OUTPUT.ome.tif [options]
 ```
 
 | Flag | Default | Meaning |
@@ -101,7 +103,7 @@ regiongrow-preprocess-ome-tiff INPUT.ome.tif OUTPUT.ome.tif [options]
 | **`--no-predictor`** | off | Disable horizontal differencing (slightly larger files). |
 | **`--tile`** | *(auto)* | Optional 3D tile shape for writes, e.g. **`128,128,128`** (Z,Y,X). |
 
-#### `regiongrow-convert-to-ome-zarr` (related)
+#### `holvesseg-convert-to-ome-zarr` (related)
 
 Not preprocessing, but usually the **first** step. Optional flags:
 
@@ -121,18 +123,18 @@ Not preprocessing, but usually the **first** step. Optional flags:
 
 ```bash
 # 1) Build a multiscale store from TIFF / OME-TIFF / other BioIO formats
-regiongrow-convert-to-ome-zarr volume.ome.tif -o volume.ome.zarr --levels 6
-regiongrow-convert-to-ome-zarr stack.tif -o stack.ome.zarr --voxel-size 2.0,0.65,0.65
+holvesseg-convert-to-ome-zarr volume.ome.tif -o volume.ome.zarr --levels 6
+holvesseg-convert-to-ome-zarr stack.tif -o stack.ome.zarr --voxel-size 2.0,0.65,0.65
 
 # 2) Optional: new store with contrast stretch only (same voxel grid)
-regiongrow-preprocess-zarr volume.ome.zarr volume_stretched.ome.zarr --stretch --no-downsample
+holvesseg-preprocess-zarr volume.ome.zarr volume_stretched.ome.zarr --stretch --no-downsample
 
 # 3) Optional: downsample + stretch (rebuilds pyramid from new finest level)
-regiongrow-preprocess-zarr volume.ome.zarr volume_ds.ome.zarr --stretch --downsample-z 2 --downsample-xy 2
+holvesseg-preprocess-zarr volume.ome.zarr volume_ds.ome.zarr --stretch --downsample-z 2 --downsample-xy 2
 
 # Alternative path: preprocess OME-TIFF first, then convert
-regiongrow-preprocess-ome-tiff in.ome.tif out_stretched.ome.tif --stretch --overwrite
-regiongrow-convert-to-ome-zarr out_stretched.ome.tif -o out_stretched.ome.zarr
+holvesseg-preprocess-ome-tiff in.ome.tif out_stretched.ome.tif --stretch --overwrite
+holvesseg-convert-to-ome-zarr out_stretched.ome.tif -o out_stretched.ome.zarr
 ```
 
 </details>
@@ -167,7 +169,7 @@ These controls live under **Layers** in the plugin dock. They govern **how much 
 **RAM, chunks, ROI, and seed tube size**
 
 - **Zarr chunking** helps on **disk** and when napari reads OME-Zarr; **Compute Branch** still materializes a **local float32** region (whole level or ROI).  
-- If grow runs out of memory: keep **ROI crop** on, use a **coarser Pyramid level**, or **`regiongrow-preprocess-zarr`** to downsample on disk first.  
+- If grow runs out of memory: keep **ROI crop** on, use a **coarser Pyramid level**, or **`holvesseg-preprocess-zarr`** to downsample on disk first.  
 - A **seed tube radius** that is **too small** can **under-segment** bends and sharp edges — the corridor simply does not cover the lumen. **Fix:** increase **Seed tube radius**, add more branch points on tortuous paths, and/or turn **off ROI crop** if the bounding box cuts off vessel context at corners.  
 - **Uncheck ROI** only when you accept the higher RAM cost of loading a larger subvolume or full level.
 
@@ -177,7 +179,7 @@ These controls live under **Layers** in the plugin dock. They govern **how much 
 
 **Coarse first, detail later:** sketch the vessel tree on a **coarse Pyramid level**. Move to finer levels when you want more detail or before final export — **upsampling is optional**, not a required step between every stage.
 
-1. **Setup** — Open **Plugins → Region Grow Vessel Segmentation**, then load a 3D volume in napari (OME-Zarr or other).
+1. **Setup** — Open **Plugins → Hollow Vessel Branch Segmentation**, then load a 3D volume in napari (OME-Zarr or other).
 2. **Coarse level** — **Layers → Pyramid level** → choose a **coarse** level (not finest).
 3. **Image & mask** — Select **Image**. Choose or create **Segmentation mask** (empty is OK for the first branch).
 4. **(Optional) Blockers** — **New Blocker** if growth leaks at organ boundaries.
@@ -190,7 +192,7 @@ These controls live under **Layers** in the plugin dock. They govern **how much 
 
 ## Step-by-step (detailed)
 
-1. Open napari. Open the widget: **Plugins → Region Grow Vessel Segmentation**.
+1. Open napari. Open the widget: **Plugins → Hollow Vessel Branch Segmentation**.
 2. Load a 3D image (single channel, shape Z×Y×X). For **OME-Zarr**, install **napari-ome-zarr** and open the `.ome.zarr` directory.
 3. Select the image in **Layers → Image**. Selecting an image creates an empty **`Segmentation`** mask on that grid when none exists yet (you can also use **New Mask**).
 4. Under **Segmentation**, use **Segmentation mask** to choose the labels layer that receives **Merge Branch** and supplies context during grow (union with the preview). Use **New Mask** for additional empty masks. An **empty** mask is valid for the **first** segment.
@@ -357,7 +359,7 @@ Playback length follows the number of captured frames and GIF playback FPS. Fram
 | **seed_mask is empty** | Increase **Seed tube radius**; check points on vessel; check blockers. |
 | **Under-segmentation at bends** | Larger **Seed tube radius**; more branch points; disable **ROI crop** if box is too tight. |
 | **start_point and end_point coincide** | ≥2 distinct points. |
-| **NaN/Inf in image** | Reload; another pyramid level; `regiongrow-preprocess-zarr`. |
+| **NaN/Inf in image** | Reload; another pyramid level; `holvesseg-preprocess-zarr`. |
 | **does not match any image pyramid level** (save) | Match **Pyramid level** or save at **Full finest resolution**. |
 | **not an .ome.zarr store** | Select store **root**. |
 | **Out-of-memory on grow** | ROI crop on; coarser level; preprocess on disk. |
